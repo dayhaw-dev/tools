@@ -1,2 +1,11 @@
 # tools
-Personal Windows utilities. Source + releases, listed at dayhaw.dev/tools
+
+Personal Windows utilities and scripts. Each tool lives in its own folder
+with source and build instructions. Compiled downloads are in
+[Releases](../../releases). Listed at dayhaw.dev/tools.
+
+## Tools
+
+| Tool | Description | Download |
+|------|-------------|----------|
+| [setres](setres/) | Per-monitor resolution switcher, immune to display index shuffling | [setres v1.0](../../releases/tag/setres-v1.0) |
