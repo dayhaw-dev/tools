@@ -1,0 +1,15 @@
+{
+  "tvIp": "192.168.1.100",
+  "tvMac": "AA:BB:CC:DD:EE:FF",
+  "tvInput": "HDMI4",
+  "couchAudioMatch": "Soundbar or TV audio device name",
+  "deskAudioMatch": "Desk DAC or headset device name",
+  "couchDisplayMatch": "TV display friendly name",
+  "deskDisplayMatch": "Desk monitor friendly name",
+  "interKeyDelayMs": 700,
+  "inputMethod": "keys",
+  "tvInputLeftPresses": 5,
+  "sourceBarOpenDelayMs": 1000,
+  "tvInputRightPresses": 5,
+  "minimizeDisplayMatch": "LG ULTRAGEAR"
+}

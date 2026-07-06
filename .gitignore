@@ -427,3 +427,7 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local tvmode machine config and Samsung pairing token
+tvmode/tvmode.json
+tvmode/tvmode.token
