@@ -53,29 +53,46 @@ internal static class TvMode
             return RunAudioRepro(args[1]);
         }
 
-        if (args.Length != 1 || !IsMode(args[0]))
+        if (args.Length is < 1 or > 2 || !IsMode(args[0]))
         {
             PrintUsage();
             return ExitError;
         }
 
+        var mode = args[0].ToLowerInvariant();
+        var forceInput = false;
+        if (args.Length == 2)
+        {
+            if (mode == "couch" && args[1].Equals("--force-input", StringComparison.OrdinalIgnoreCase))
+            {
+                forceInput = true;
+            }
+            else
+            {
+                PrintUsage();
+                return ExitError;
+            }
+        }
+
         var exeDirectory = AppContext.BaseDirectory;
         var configPath = Path.Combine(exeDirectory, "tvmode.json");
+        var windowStatePath = Path.Combine(exeDirectory, "tvmode.windows.json");
         if (!TryLoadConfig(configPath, out var config))
         {
             return ExitError;
         }
 
-        var mode = args[0].ToLowerInvariant();
         if (mode == "desk")
         {
             var displayOk = RunStep("display", () => DisplayManager.SetPrimary(config.DeskDisplayMatch));
+            RunStep("windows", () => WindowManager.RestoreFromState(windowStatePath));
             var audioOk = RunStep("audio", () => AudioManager.SetDefaultPlaybackDevice(config.DeskAudioMatch));
             return displayOk && audioOk ? ExitOk : ExitError;
         }
 
         var tokenPath = Path.Combine(exeDirectory, "tvmode.token");
         var workingTvIp = config.TvIp;
+        var tvWasAwakeBeforeWake = await NetworkTools.CanConnectToTvRemoteAsync(config.TvIp, TimeSpan.FromSeconds(2));
 
         await RunStepAsync("wake", () => NetworkTools.SendWakeOnLanAsync(config.TvMac));
         var tvOnline = await RunStepAsync("network", async () =>
@@ -89,15 +106,34 @@ internal static class TvMode
 
         if (tvOnline)
         {
-            await RunStepAsync("input", () => SamsungTvRemote.SwitchInputAsync(
-                workingTvIp,
-                config.TvInput,
-                tokenPath,
-                config.InputMethod,
-                config.InterKeyDelay,
-                config.SourceBarOpenDelay,
-                config.TvInputLeftPresses,
-                config.TvInputRightPresses));
+            var inputMethod = forceInput ? "keys" : config.InputMethod;
+            if (!forceInput && config.AssumeInputWhenOnResolved && tvWasAwakeBeforeWake && config.ResolvedInputMethod == "keys")
+            {
+                Log("input", true, $"skipped KEY_SOURCE navigation because TV was already reachable before wake and assumeInputWhenOn is true; use --force-input to run it");
+            }
+            else
+            {
+                var reason = forceInput
+                    ? "--force-input requested KEY_SOURCE navigation"
+                    : tvWasAwakeBeforeWake
+                        ? "TV was already reachable before wake, but navigation was not skipped"
+                        : "TV was not reachable before wake, running configured input sequence";
+                await RunStepAsync("input", async () =>
+                {
+                    var result = await SamsungTvRemote.SwitchInputAsync(
+                        workingTvIp,
+                        config.TvInput,
+                        tokenPath,
+                        inputMethod,
+                        config.InterKeyDelay,
+                        config.SourceBarOpenDelay,
+                        config.TvInputLeftPresses,
+                        config.TvInputRightPresses);
+                    return result.Success
+                        ? StepResult.Ok($"{result.Message}; {reason}")
+                        : result;
+                });
+            }
         }
         else
         {
@@ -105,7 +141,7 @@ internal static class TvMode
         }
 
         var couchDisplayOk = RunStep("display", () => DisplayManager.SetPrimary(config.CouchDisplayMatch));
-        RunStep("windows", () => WindowManager.MinimizeOnDisplay(config.MinimizeDisplayMatch));
+        RunStep("windows", () => WindowManager.MinimizeOnDisplay(config.MinimizeDisplayMatch, windowStatePath));
         var couchAudioOk = RunStep("audio", () => AudioManager.SetDefaultPlaybackDevice(config.CouchAudioMatch));
 
         return couchDisplayOk && couchAudioOk ? ExitOk : ExitError;
@@ -155,6 +191,7 @@ internal static class TvMode
     private static void PrintUsage()
     {
         Console.Error.WriteLine("Usage: tvmode couch|desk");
+        Console.Error.WriteLine("Usage: tvmode couch --force-input");
         Console.Error.WriteLine("Diagnostic: tvmode input-direct");
         Console.Error.WriteLine("Diagnostic: tvmode key <KEYNAME> [Click|PressRelease]");
         Console.Error.WriteLine("Diagnostic: tvmode audio-repro <audio device name substring>");
@@ -264,11 +301,13 @@ internal sealed record TvModeConfig(
     int? TvInputLeftPresses = null,
     int? SourceBarOpenDelayMs = null,
     int? TvInputRightPresses = null,
-    string? MinimizeDisplayMatch = null)
+    string? MinimizeDisplayMatch = null,
+    bool? AssumeInputWhenOn = null)
 {
     public TimeSpan InterKeyDelay => TimeSpan.FromMilliseconds(InterKeyDelayMs ?? 700);
     public TimeSpan SourceBarOpenDelay => TimeSpan.FromMilliseconds(SourceBarOpenDelayMs ?? 1000);
     public string ResolvedInputMethod => string.IsNullOrWhiteSpace(InputMethod) ? "auto" : InputMethod.Trim().ToLowerInvariant();
+    public bool AssumeInputWhenOnResolved => AssumeInputWhenOn ?? true;
 
     public bool IsValid(out string error)
     {
@@ -397,6 +436,11 @@ internal static class NetworkTools
         }
 
         return new TvResolveResult(false, foundIp, warning + ", but port 8002 still did not respond");
+    }
+
+    public static Task<bool> CanConnectToTvRemoteAsync(string ipAddress, TimeSpan timeout)
+    {
+        return CanConnectAsync(ipAddress, 8002, timeout);
     }
 
     public static bool TryParseMac(string macAddress, out byte[] bytes)
@@ -1092,20 +1136,23 @@ internal static class WindowManager
     private const int GWL_EXSTYLE = -20;
     private const int GW_OWNER = 4;
     private const int SW_MINIMIZE = 6;
+    private const int SW_RESTORE = 9;
     private const int MONITOR_DEFAULTTONULL = 0;
     private const int DWMWA_CLOAKED = 14;
     private const long WS_EX_TOOLWINDOW = 0x00000080L;
 
-    public static StepResult MinimizeOnDisplay(string? displayMatch)
+    public static StepResult MinimizeOnDisplay(string? displayMatch, string statePath)
     {
         try
         {
+            DeleteStateFile(statePath);
             var display = DisplayManager.FindMonitorDevicesByFriendlyName(displayMatch);
             if (!display.ShouldMinimize)
             {
                 return StepResult.Ok($"warning: {display.Message}");
             }
 
+            var handles = new List<string>();
             var minimized = 0;
             var skipped = 0;
             NativeMethods.EnumWindows((hwnd, _) =>
@@ -1126,13 +1173,56 @@ internal static class WindowManager
                 if (monitorDeviceName.Equals(display.DeviceName, StringComparison.OrdinalIgnoreCase))
                 {
                     NativeMethods.ShowWindow(hwnd, SW_MINIMIZE);
+                    handles.Add(hwnd.ToInt64().ToString("X"));
                     minimized++;
                 }
 
                 return true;
             }, IntPtr.Zero);
 
-            return StepResult.Ok($"minimized {minimized} windows on {display.FriendlyName} ({display.DeviceName}); skipped {skipped}");
+            var state = new WindowState(handles);
+            File.WriteAllText(statePath, JsonSerializer.Serialize(state, TvMode.JsonOptions));
+
+            return StepResult.Ok($"minimized {minimized} windows on {display.FriendlyName} ({display.DeviceName}); saved {handles.Count} handles; skipped {skipped}");
+        }
+        catch (Exception ex)
+        {
+            return StepResult.Fail(ex.Message);
+        }
+    }
+
+    public static StepResult RestoreFromState(string statePath)
+    {
+        if (!File.Exists(statePath))
+        {
+            return StepResult.Ok("no saved window state");
+        }
+
+        try
+        {
+            var state = JsonSerializer.Deserialize<WindowState>(File.ReadAllText(statePath), TvMode.JsonOptions);
+            var restored = 0;
+            var skipped = 0;
+            foreach (var handleText in state?.Handles ?? [])
+            {
+                if (!TryParseHandle(handleText, out var hwnd) || !NativeMethods.IsWindow(hwnd))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                if (!NativeMethods.IsIconic(hwnd))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                NativeMethods.ShowWindow(hwnd, SW_RESTORE);
+                restored++;
+            }
+
+            DeleteStateFile(statePath);
+            return StepResult.Ok($"restored {restored} saved minimized windows; skipped {skipped}");
         }
         catch (Exception ex)
         {
@@ -1197,6 +1287,35 @@ internal static class WindowManager
         deviceName = monitorInfo.szDevice;
         return !string.IsNullOrWhiteSpace(deviceName);
     }
+
+    private static bool TryParseHandle(string value, out IntPtr hwnd)
+    {
+        hwnd = IntPtr.Zero;
+        if (!long.TryParse(value, System.Globalization.NumberStyles.HexNumber, null, out var handle))
+        {
+            return false;
+        }
+
+        hwnd = new IntPtr(handle);
+        return hwnd != IntPtr.Zero;
+    }
+
+    private static void DeleteStateFile(string statePath)
+    {
+        try
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
+        catch
+        {
+            // Stale state is not worth blocking mode switching.
+        }
+    }
+
+    private sealed record WindowState(IReadOnlyList<string> Handles);
 }
 
 internal static class AudioManager
@@ -1531,6 +1650,10 @@ internal static partial class NativeMethods
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

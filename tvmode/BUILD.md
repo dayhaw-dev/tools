@@ -30,7 +30,9 @@ wait for ms.channel.connect, KEY_SOURCE, wait sourceBarOpenDelayMs, KEY_LEFT x<t
 
 The default inter-key delay is `700ms`, configurable through `interKeyDelayMs` in `tvmode.json`. The `keys` input method also supports `sourceBarOpenDelayMs`, `tvInputLeftPresses`, and `tvInputRightPresses` for tuning source-bar navigation.
 
-`couch` minimizes windows only on `minimizeDisplayMatch`. If no display matches, it logs a warning and skips minimization.
+Current-source reads were not found in the local 2022 Tizen REST/websocket APIs used by `samsung-tv-ws-api` or Home Assistant's built-in Samsung TV integration. `assumeInputWhenOn` defaults to `true`, so `inputMethod: "keys"` skips navigation when the TV was already reachable before wake. Run `tvmode couch --force-input` to send KEY_SOURCE navigation regardless.
+
+`couch` minimizes windows only on `minimizeDisplayMatch`. If no display matches, it logs a warning and skips minimization. Minimized window handles are saved to `tvmode.windows.json`; `desk` restores still-valid minimized handles from that file, then deletes it.
 
 ## Audio Diagnostics
 

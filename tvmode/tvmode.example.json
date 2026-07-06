@@ -11,5 +11,6 @@
   "tvInputLeftPresses": 5,
   "sourceBarOpenDelayMs": 1000,
   "tvInputRightPresses": 5,
-  "minimizeDisplayMatch": "LG ULTRAGEAR"
+  "minimizeDisplayMatch": "LG ULTRAGEAR",
+  "assumeInputWhenOn": true
 }
