@@ -8,6 +8,6 @@ with source and build instructions. Compiled downloads are in
 
 | Tool | Description | Download |
 |------|-------------|----------|
-| [audioswap](audioswap/) | Toggle the default playback device between two configured outputs | [Latest release](../../releases) |
-| [setres](setres/) | Per-monitor resolution switcher, immune to display index shuffling | [Latest release](../../releases/tag/setres-v1.0) |
-| [tvmode](tvmode/) | One-command desk/couch mode switcher for display, audio, and Samsung TV input | [Latest release](../../releases) |
+| [audioswap](audioswap/) | Toggle the default playback device between two configured outputs | [Latest](../../releases) |
+| [setres](setres/) | Per-monitor resolution switcher, immune to display index shuffling | [Latest](../../releases/tag/setres-v1.0) |
+| [tvmode](tvmode/) | One-command desk/couch mode switcher for display, audio, and Samsung TV input | [Latest](../../releases) |
