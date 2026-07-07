@@ -1,5 +1,5 @@
 {
-  "tvIp": "192.168.1.100",
+  "tvIp": "192.168.1.x",
   "tvMac": "AA:BB:CC:DD:EE:FF",
   "tvInput": "HDMI4",
   "couchAudioMatch": "Soundbar or TV audio device name",

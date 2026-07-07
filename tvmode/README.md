@@ -12,8 +12,8 @@ Copy `tvmode.example.json` to `tvmode.json` next to `tvmode.exe`, then fill in y
 
 ```json
 {
-  "tvIp": "192.168.1.155",
-  "tvMac": "80:8A:BD:57:F3:64",
+  "tvIp": "192.168.1.x",
+  "tvMac": "AA:BB:CC:DD:EE:FF",
   "tvInput": "HDMI4",
   "couchAudioMatch": "QBQ90S",
   "deskAudioMatch": "Qudelix",
