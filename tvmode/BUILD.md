@@ -28,11 +28,11 @@ The tool saves the token returned by the `ms.channel.connect` event. The tested 
 wait for ms.channel.connect, KEY_SOURCE, wait sourceBarOpenDelayMs, KEY_LEFT x<tvInputLeftPresses>, KEY_RIGHT x<tvInputRightPresses>, KEY_ENTER
 ```
 
-The default inter-key delay is `700ms`, configurable through `interKeyDelayMs` in `tvmode.json`. The `keys` input method also supports `sourceBarOpenDelayMs`, `tvInputLeftPresses`, and `tvInputRightPresses` for tuning source-bar navigation.
+The default inter-key delay is `700ms`, configurable through `interKeyDelayMs` in `tvmode.json`. The `keys` input method also supports `sourceBarOpenDelayMs`, `tvInputLeftPresses`, and `tvInputRightPresses` for tuning source-bar navigation. `wakeSettleDelayMs` defaults to `4000` and waits after KEY_POWER or WoL wake before input navigation starts.
 
 Current-source reads were not found in the local 2022 Tizen REST/websocket APIs used by `samsung-tv-ws-api` or Home Assistant's built-in Samsung TV integration. `assumeInputWhenOn` defaults to `true`, so `inputMethod: "keys"` skips navigation only when REST reports `PowerState: "on"` before wake. Run `tvmode couch --force-input` to send KEY_SOURCE navigation regardless.
 
-Wake handling uses `http://tvIp:8001/api/v2/` before WoL. `PowerState: "on"` means genuinely awake. Reachable REST with `standby`, missing, or ambiguous `PowerState` means fast standby, so `tvmode` sends `KEY_POWER` over the tokenized websocket, waits up to about 15 seconds for `PowerState: "on"`, and then runs KEY_SOURCE navigation. Unreachable REST means deep standby/off, so `tvmode` sends WoL and waits for port `8002` as before.
+Wake handling uses `http://tvIp:8001/api/v2/` before WoL. `PowerState: "on"` means genuinely awake. Reachable REST with `standby`, missing, or ambiguous `PowerState` means fast standby, so `tvmode` sends `KEY_POWER` over the tokenized websocket, waits up to about 15 seconds for `PowerState: "on"`, waits `wakeSettleDelayMs`, and then runs KEY_SOURCE navigation. Unreachable REST means deep standby/off, so `tvmode` sends WoL, waits for port `8002`, waits `wakeSettleDelayMs`, and then runs navigation.
 
 `couch` minimizes windows only on `minimizeDisplayMatch`. If no display matches, it logs a warning and skips minimization. Minimized window handles are saved to `tvmode.windows.json`; `desk` restores still-valid minimized handles from that file, then deletes it.
 

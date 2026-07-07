@@ -95,6 +95,7 @@ internal static class TvMode
         var workingTvIp = config.TvIp;
         var mustNavigateInput = forceInput;
         var canAssumeInputWhenOn = false;
+        var applyWakeSettleDelay = false;
         var initialPower = await NetworkTools.QueryTvPowerStateAsync(config.TvIp);
         var tvOnline = false;
 
@@ -124,6 +125,7 @@ internal static class TvMode
                     : StepResult.Fail($"path=fast-standby; initial REST PowerState={initialPower.StateForLog}; sent KEY_POWER; {waitResult.Message}");
             });
             tvOnline = powerKeySent;
+            applyWakeSettleDelay = powerKeySent;
             Log("network", tvOnline, confirmedOn
                 ? $"TV reported PowerState=on at {workingTvIp}:8001 after KEY_POWER"
                 : powerKeySent
@@ -143,10 +145,20 @@ internal static class TvMode
                     ? StepResult.Ok(resolved.Warning ?? $"TV reachable at {resolved.WorkingIp}:8002 after WoL")
                     : StepResult.Fail(resolved.Warning ?? $"TV did not respond at {config.TvIp}:8002 and no ARP entry matched {config.TvMac}");
             });
+            applyWakeSettleDelay = tvOnline;
         }
 
         if (tvOnline)
         {
+            if (applyWakeSettleDelay)
+            {
+                await RunStepAsync("settle", async () =>
+                {
+                    await Task.Delay(config.WakeSettleDelay);
+                    return StepResult.Ok($"waited {config.WakeSettleDelay.TotalMilliseconds:0}ms for Tizen UI to accept remote keys");
+                });
+            }
+
             var inputMethod = mustNavigateInput ? "keys" : config.InputMethod;
             if (!forceInput && !mustNavigateInput && config.AssumeInputWhenOnResolved && canAssumeInputWhenOn && config.ResolvedInputMethod == "keys")
             {
@@ -343,10 +355,12 @@ internal sealed record TvModeConfig(
     int? SourceBarOpenDelayMs = null,
     int? TvInputRightPresses = null,
     string? MinimizeDisplayMatch = null,
-    bool? AssumeInputWhenOn = null)
+    bool? AssumeInputWhenOn = null,
+    int? WakeSettleDelayMs = null)
 {
     public TimeSpan InterKeyDelay => TimeSpan.FromMilliseconds(InterKeyDelayMs ?? 700);
     public TimeSpan SourceBarOpenDelay => TimeSpan.FromMilliseconds(SourceBarOpenDelayMs ?? 1000);
+    public TimeSpan WakeSettleDelay => TimeSpan.FromMilliseconds(WakeSettleDelayMs ?? 4000);
     public string ResolvedInputMethod => string.IsNullOrWhiteSpace(InputMethod) ? "auto" : InputMethod.Trim().ToLowerInvariant();
     public bool AssumeInputWhenOnResolved => AssumeInputWhenOn ?? true;
 
@@ -411,6 +425,12 @@ internal sealed record TvModeConfig(
         if (SourceBarOpenDelayMs is < 0)
         {
             error = $"invalid {nameof(SourceBarOpenDelayMs)}: {SourceBarOpenDelayMs}";
+            return false;
+        }
+
+        if (WakeSettleDelayMs is < 0)
+        {
+            error = $"invalid {nameof(WakeSettleDelayMs)}: {WakeSettleDelayMs}";
             return false;
         }
 

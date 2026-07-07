@@ -12,5 +12,6 @@
   "sourceBarOpenDelayMs": 1000,
   "tvInputRightPresses": 5,
   "minimizeDisplayMatch": "LG ULTRAGEAR",
-  "assumeInputWhenOn": true
+  "assumeInputWhenOn": true,
+  "wakeSettleDelayMs": 4000
 }
