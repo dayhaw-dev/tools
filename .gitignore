@@ -432,3 +432,6 @@ FodyWeavers.xsd
 tvmode/tvmode.json
 tvmode/tvmode.token
 tvmode/tvmode.windows.json
+
+# Local audioswap machine config
+audioswap/audioswap.json
