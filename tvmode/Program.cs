@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Microsoft.Win32;
 using System.Net;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
@@ -92,32 +93,72 @@ internal static class TvMode
 
         var tokenPath = Path.Combine(exeDirectory, "tvmode.token");
         var workingTvIp = config.TvIp;
-        var tvWasAwakeBeforeWake = await NetworkTools.CanConnectToTvRemoteAsync(config.TvIp, TimeSpan.FromSeconds(2));
+        var mustNavigateInput = forceInput;
+        var canAssumeInputWhenOn = false;
+        var initialPower = await NetworkTools.QueryTvPowerStateAsync(config.TvIp);
+        var tvOnline = false;
 
-        await RunStepAsync("wake", () => NetworkTools.SendWakeOnLanAsync(config.TvMac));
-        var tvOnline = await RunStepAsync("network", async () =>
+        if (initialPower.Reachable && initialPower.IsOn)
         {
-            var resolved = await NetworkTools.ResolveTvIpAsync(config.TvIp, config.TvMac, TimeSpan.FromSeconds(30));
-            workingTvIp = resolved.WorkingIp;
-            return resolved.Success
-                ? StepResult.Ok(resolved.Warning ?? $"TV reachable at {resolved.WorkingIp}:8002")
-                : StepResult.Fail(resolved.Warning ?? $"TV did not respond at {config.TvIp}:8002 and no ARP entry matched {config.TvMac}");
-        });
+            tvOnline = true;
+            canAssumeInputWhenOn = true;
+            Log("wake", true, $"path=on; REST PowerState={initialPower.StateForLog}; TV is already awake");
+            Log("network", true, $"TV reachable at {workingTvIp}:8001 with PowerState={initialPower.StateForLog}");
+        }
+        else if (initialPower.Reachable)
+        {
+            mustNavigateInput = true;
+            var powerKeySent = false;
+            var confirmedOn = await RunStepAsync("wake", async () =>
+            {
+                var powerResult = await SamsungTvRemote.SendPowerKeyAsync(workingTvIp, tokenPath);
+                if (!powerResult.Success)
+                {
+                    return StepResult.Fail($"path=fast-standby; REST PowerState={initialPower.StateForLog}; {powerResult.Message}");
+                }
+
+                powerKeySent = true;
+                var waitResult = await NetworkTools.WaitForPowerStateOnAsync(workingTvIp, TimeSpan.FromSeconds(15));
+                return waitResult.Success
+                    ? StepResult.Ok($"path=fast-standby; initial REST PowerState={initialPower.StateForLog}; sent KEY_POWER; observed {waitResult.Message}")
+                    : StepResult.Fail($"path=fast-standby; initial REST PowerState={initialPower.StateForLog}; sent KEY_POWER; {waitResult.Message}");
+            });
+            tvOnline = powerKeySent;
+            Log("network", tvOnline, confirmedOn
+                ? $"TV reported PowerState=on at {workingTvIp}:8001 after KEY_POWER"
+                : powerKeySent
+                    ? $"continuing after KEY_POWER even though PowerState=on was not confirmed"
+                    : $"TV did not wake because KEY_POWER was not sent");
+        }
+        else
+        {
+            mustNavigateInput = true;
+            Log("wake", true, $"path=deep-standby; REST PowerState={initialPower.StateForLog}; sending WoL");
+            await RunStepAsync("wol", () => NetworkTools.SendWakeOnLanAsync(config.TvMac));
+            tvOnline = await RunStepAsync("network", async () =>
+            {
+                var resolved = await NetworkTools.ResolveTvIpAsync(config.TvIp, config.TvMac, TimeSpan.FromSeconds(30));
+                workingTvIp = resolved.WorkingIp;
+                return resolved.Success
+                    ? StepResult.Ok(resolved.Warning ?? $"TV reachable at {resolved.WorkingIp}:8002 after WoL")
+                    : StepResult.Fail(resolved.Warning ?? $"TV did not respond at {config.TvIp}:8002 and no ARP entry matched {config.TvMac}");
+            });
+        }
 
         if (tvOnline)
         {
-            var inputMethod = forceInput ? "keys" : config.InputMethod;
-            if (!forceInput && config.AssumeInputWhenOnResolved && tvWasAwakeBeforeWake && config.ResolvedInputMethod == "keys")
+            var inputMethod = mustNavigateInput ? "keys" : config.InputMethod;
+            if (!forceInput && !mustNavigateInput && config.AssumeInputWhenOnResolved && canAssumeInputWhenOn && config.ResolvedInputMethod == "keys")
             {
-                Log("input", true, $"skipped KEY_SOURCE navigation because TV was already reachable before wake and assumeInputWhenOn is true; use --force-input to run it");
+                Log("input", true, $"skipped KEY_SOURCE navigation because REST PowerState={initialPower.StateForLog} and assumeInputWhenOn is true; use --force-input to run it");
             }
             else
             {
                 var reason = forceInput
                     ? "--force-input requested KEY_SOURCE navigation"
-                    : tvWasAwakeBeforeWake
-                        ? "TV was already reachable before wake, but navigation was not skipped"
-                        : "TV was not reachable before wake, running configured input sequence";
+                    : mustNavigateInput
+                        ? $"wake path requires KEY_SOURCE navigation; initial REST PowerState={initialPower.StateForLog}"
+                        : $"TV was already on with REST PowerState={initialPower.StateForLog}, but navigation was not skipped";
                 await RunStepAsync("input", async () =>
                 {
                     var result = await SamsungTvRemote.SwitchInputAsync(
@@ -384,10 +425,70 @@ internal readonly record struct StepResult(bool Success, string Message)
     public static StepResult Fail(string message) => new(false, message);
 }
 
+internal readonly record struct TvPowerStateResult(bool Reachable, string? PowerState, string Message)
+{
+    public bool IsOn => PowerState?.Equals("on", StringComparison.OrdinalIgnoreCase) == true;
+    public string StateForLog => string.IsNullOrWhiteSpace(PowerState) ? Message : PowerState;
+}
+
 internal readonly record struct TvResolveResult(bool Success, string WorkingIp, string? Warning);
 
 internal static class NetworkTools
 {
+    public static async Task<TvPowerStateResult> QueryTvPowerStateAsync(string ipAddress)
+    {
+        using var httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(3)
+        };
+
+        try
+        {
+            using var response = await httpClient.GetAsync($"http://{ipAddress}:8001/api/v2/");
+            var body = await response.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return new TvPowerStateResult(true, null, $"reachable, HTTP {(int)response.StatusCode}, empty device-info response");
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(body);
+                var powerState = FindStringProperty(document.RootElement, "PowerState");
+                return string.IsNullOrWhiteSpace(powerState)
+                    ? new TvPowerStateResult(true, null, $"reachable, HTTP {(int)response.StatusCode}, PowerState missing")
+                    : new TvPowerStateResult(true, powerState, $"reachable, HTTP {(int)response.StatusCode}, PowerState={powerState}");
+            }
+            catch (JsonException ex)
+            {
+                return new TvPowerStateResult(true, null, $"reachable, HTTP {(int)response.StatusCode}, invalid device-info JSON: {ex.Message}");
+            }
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or SocketException or IOException)
+        {
+            return new TvPowerStateResult(false, null, $"unreachable on http://{ipAddress}:8001/api/v2/: {ex.Message}");
+        }
+    }
+
+    public static async Task<StepResult> WaitForPowerStateOnAsync(string ipAddress, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        var seenStates = new List<string>();
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var state = await QueryTvPowerStateAsync(ipAddress);
+            seenStates.Add(state.StateForLog);
+            if (state.IsOn)
+            {
+                return StepResult.Ok($"PowerState sequence: {string.Join(" -> ", seenStates)}");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1));
+        }
+
+        return StepResult.Fail($"timed out waiting for PowerState=on after {timeout.TotalSeconds:0}s; observed: {string.Join(" -> ", seenStates)}");
+    }
+
     public static async Task<StepResult> SendWakeOnLanAsync(string macAddress)
     {
         if (!TryParseMac(macAddress, out var macBytes))
@@ -546,6 +647,39 @@ internal static class NetworkTools
     {
         return new string(macAddress.Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
     }
+
+    private static string? FindStringProperty(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                if (property.Name.Equals(propertyName, StringComparison.OrdinalIgnoreCase) && property.Value.ValueKind == JsonValueKind.String)
+                {
+                    return property.Value.GetString();
+                }
+
+                var nested = FindStringProperty(property.Value, propertyName);
+                if (!string.IsNullOrWhiteSpace(nested))
+                {
+                    return nested;
+                }
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                var nested = FindStringProperty(item, propertyName);
+                if (!string.IsNullOrWhiteSpace(nested))
+                {
+                    return nested;
+                }
+            }
+        }
+
+        return null;
+    }
 }
 
 internal static class SamsungTvRemote
@@ -588,6 +722,29 @@ internal static class SamsungTvRemote
         catch (Exception ex)
         {
             return StepResult.Fail($"{resolvedMethod} input switch failed: {ex.Message}");
+        }
+    }
+
+    public static async Task<StepResult> SendPowerKeyAsync(string ipAddress, string tokenPath)
+    {
+        var token = ReadToken(tokenPath);
+        await using var remote = new SamsungWebSocket(ipAddress, token);
+        try
+        {
+            await remote.ConnectAsync();
+            if (!string.IsNullOrWhiteSpace(remote.Token) && remote.Token != token)
+            {
+                File.WriteAllText(tokenPath, remote.Token);
+            }
+
+            remote.StartMessagePump();
+            await remote.SendRemoteKeyAsync("KEY_POWER");
+            Console.WriteLine("wake: key -> KEY_POWER");
+            return StepResult.Ok($"sent KEY_POWER to {ipAddress}");
+        }
+        catch (Exception ex)
+        {
+            return StepResult.Fail($"KEY_POWER failed: {ex.Message}");
         }
     }
 
