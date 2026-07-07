@@ -17,7 +17,7 @@ Copy `audioswap.example.json` to `audioswap.json` next to `audioswap.exe`, then 
 
 If the current default playback device contains `deviceA`, `audioswap` switches to the first active playback device containing `deviceB`. If the current default contains `deviceB`, it switches to `deviceA`. If the current default matches neither, it switches to `deviceA`.
 
-If the target device is not active or not present, no change is made and the available active playback devices are printed.
+If the target device is not active or not present, no change is made, the available active playback devices are printed, and the process exits `1`.
 
 ## Usage
 

@@ -433,5 +433,8 @@ tvmode/tvmode.json
 tvmode/tvmode.token
 tvmode/tvmode.windows.json
 
-# Local audioswap machine config
+# Local audioswap machine config and state
 audioswap/audioswap.json
+audioswap/audioswap.token
+audioswap/audioswap.state.json
+audioswap/audioswap.windows.json
