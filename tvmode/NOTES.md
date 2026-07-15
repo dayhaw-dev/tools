@@ -72,6 +72,8 @@ Current HDMI/source detection research for 2022 Tizen/S95B: the unauthenticated 
 
 Home Assistant's built-in `samsungtv` integration similarly treats source selection as commands (`KEY_TV`, `KEY_HDMI`, or app launch) and uses device info only for power/model metadata.
 
+Integrations that report an exact HDMI source on these models rely on optional SmartThings cloud state. `tvmode` remains local-only and does not require a Samsung account or cloud token.
+
 For this S95B path, `tvmode` therefore uses the fallback policy: if REST reports `PowerState: "on"` before wake and `assumeInputWhenOn` is true, key navigation may be skipped; standby/off wake paths always run KEY_SOURCE navigation.
 
 ## Wake Behavior
@@ -88,13 +90,55 @@ If REST is unreachable, `tvmode` treats that as deep standby/off: it sends WoL, 
 
 ## Windows
 
+Before the `couch` primary-display step, `tvmode` checks the active display paths for `couchDisplayMatch`. If the TV is absent, it queries `QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE`, deduplicates available targets by adapter LUID and target ID, and selects the same friendly-name match used by primary-display switching.
+
+The force-attach design uses a persisted declarative mode rather than the display's EDID preferred mode. `DISPLAYCONFIG_TARGET_PREFERRED_MODE` describes the monitor's best EDID mode but does not preserve desktop position and does not guarantee the S95B's 144 Hz PC/game-mode timing. `tvDisplayMode` therefore defaults to 3840x2160 at 144 Hz and positions the TV edge-to-edge relative to `deskDisplayMatch`.
+
+The relative `position` values are literal anchors to the desk display; they do not search around intervening monitors. Set both `tvDisplayMode.x` and `tvDisplayMode.y` for a non-adjacent TV. These are absolute `DISPLAYCONFIG_SOURCE_MODE.position` coordinates and take precedence over `position`. A partial coordinate pair is rejected during config validation.
+
+The attach request copies the current active paths and modes unchanged, appends one explicit TV `DISPLAYCONFIG_SOURCE_MODE`, and requests the configured target refresh. For virtual-mode-aware paths, the source mode index is encoded in the upper 16 bits with an invalid clone group, keeping the path extended. `SDC_ALLOW_CHANGES` is deliberately omitted so Windows cannot rearrange supplied source geometry. `SDC_FORCE_MODE_ENUMERATION` gives the HDMI driver an opportunity to refresh its mode list.
+
+After each apply, `tvmode` polls for up to `coldAttachSettleDelayMs` and verifies the TV's resolution, physical refresh, and expected position, plus the size and position of every display that was active before the attach. It reapplies once if HDMI 2.1 negotiation is still settling. If verification still fails, it restores the exact pre-attach topology and skips HDR because the configured TV mode was not confirmed. `desk` never disables or detaches the TV.
+
 During `couch`, window minimization is scoped to `minimizeDisplayMatch`.
 
 `tvmode` enumerates visible top-level windows, skips tool/system/DWM-cloaked windows, checks each window's monitor, minimizes only windows on the matched display, and saves those window handles to `tvmode.windows.json` next to the executable. It never falls back to global minimize-all.
 
 During `desk`, `tvmode` restores only the saved handles that still exist and are still minimized, then deletes `tvmode.windows.json`. If no state file exists, restore is skipped without error.
 
+### HDR
+
+HDR uses the Windows display configuration API, never the global `Win+Alt+B` shortcut. The TV is resolved from `couchDisplayMatch` through the same active-path friendly-name lookup used for primary-display switching; the resulting adapter LUID and target ID are used for every query and set.
+
+On Windows 11, `DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2` is authoritative. The legacy `advancedColorActive` bit can be true for SDR wide-color-gamut/Auto Color Management, so it must not be interpreted as HDR. HDR is on only when `activeColorMode` is `DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR`, `advancedColorActive` is true, and `highDynamicRangeUserEnabled` is true. HDR is off only when the active mode is not HDR and the user-enabled bit is false.
+
+State changes use `DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE`. After a successful setter call, `tvmode` polls the v2 query for up to three seconds and logs the resulting `activeColorMode`; accepting the setter is not success by itself. Device-info types 15/16 are unavailable before Windows 11, so only `ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`, or `ERROR_INVALID_PARAMETER` trigger the legacy `GET_ADVANCED_COLOR_INFO` / `SET_ADVANCED_COLOR_STATE` fallback.
+
+The operation normally waits one second after the primary-display operation and retries once after another one-second delay because display topology changes can leave the HDR API temporarily unavailable. A successful cold attach or mode correction uses a three-second initial HDR settle after the configured mode has already been confirmed. HDR failures are warnings and do not affect the transition exit code. Set `hdr` to `off` to skip HDR changes; the default is `on`.
+
+### Audio endpoint timing
+
+The couch audio switch waits one second after the display work, tries the configured endpoint, and retries once after another one-second delay. This covers the delay between attaching an HDMI display path and Windows publishing its render endpoint.
+
+On the tested system, MMDevice enumeration throws `InvalidCastException` (`E_NOINTERFACE`, `0x80004002`) in `Marshal.GetTypedObjectForIUnknown`. This is a known low-priority interop issue: `tvmode` logs the exception and falls back to active endpoint enumeration under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render`, which works on that system.
+
+### Hardware verification
+
+The v1.2.1 couch and desk transitions were verified end to end on the S95B setup. Starting with the TV manually detached, `couch` restored the configured virtual-desktop coordinates without moving the existing displays, established 3840x2160 at 144 Hz, enabled HDR with `activeColorMode=HDR`, and found the HDMI audio endpoint on the first attempt. `desk` restored the desk primary display, saved windows, and desk audio, then disabled HDR with the non-HDR active color mode confirmed by the v2 query.
+
 ## Diagnostics
+
+`displays` lists each active display's friendly name, DisplayConfig source position, source resolution, physical refresh, and primary state without changing topology. Use these coordinates for `tvDisplayMode.x` and `y`; unlike `System.Windows.Forms.Screen.Bounds`, they are not DPI-virtualized.
+
+```powershell
+tvmode displays
+```
+
+`hdr-status` performs the same v2-first state query used after HDR changes and reports `activeColorMode`, the HDR user-enabled/support bits, advanced-color activity, and bit depth without changing state.
+
+```powershell
+tvmode hdr-status "display name substring"
+```
 
 `audio-repro` bypasses config, TV, display, and window logic. It lists active render devices, then runs only the audio switch path with detailed exception output, including COM exception type, HRESULT, and source line where available.
 

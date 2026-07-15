@@ -6,12 +6,22 @@
   "deskAudioMatch": "Desk DAC or headset device name",
   "couchDisplayMatch": "TV display friendly name",
   "deskDisplayMatch": "Desk monitor friendly name",
+  "tvDisplayMode": {
+    "width": 3840,
+    "height": 2160,
+    "refreshHz": 144,
+    // Relative values anchor directly to deskDisplayMatch. For non-adjacent layouts, replace position with both x and y.
+    "position": "rightOfDesk"
+  },
+  "coldAttachSettleDelayMs": 5000,
   "interKeyDelayMs": 700,
   "inputMethod": "keys",
   "tvInputLeftPresses": 5,
   "sourceBarOpenDelayMs": 1000,
   "tvInputRightPresses": 5,
   "minimizeDisplayMatch": "LG ULTRAGEAR",
+  // true trusts the current input when REST says the TV is on; use false or couch --force-input if it may be on another source.
   "assumeInputWhenOn": true,
-  "wakeSettleDelayMs": 4000
+  "wakeSettleDelayMs": 4000,
+  "hdr": "on"
 }

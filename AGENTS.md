@@ -48,3 +48,31 @@ Never commit:
 - other generated build outputs
 
 Keep changes scoped to the relevant tool folder unless the repository-level documentation or shared conventions need updating.
+
+## HDR Control
+
+For per-display Windows HDR, resolve the target through `QueryDisplayConfig` and the same friendly-name matching used by the tool's display selection. Use the matched adapter LUID and target ID with `DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2` and `DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE` on Windows 11. Do not use a display index or synthesize the global `Win+Alt+B` shortcut.
+
+The legacy `advancedColorActive` bit does not mean HDR on current Windows 11; it is also true for WCG/Auto Color Management. Treat HDR as active only when the v2 `activeColorMode` is `DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR`, advanced color is active, and `highDynamicRangeUserEnabled` is true. After setting, poll and re-query until the requested v2 state is observed, and include `activeColorMode` in the result log. Fall back to legacy advanced-color get/set only when v2 returns an unsupported device-info error.
+
+Display topology updates settle asynchronously. Apply HDR only after the requested display mode is confirmed. Wait briefly before the first call and retry once after another short delay; a cold HDMI 2.1 attach needs a longer initial settle than an already-active path. Treat HDR errors as nonfatal when the tool can safely continue the rest of the transition.
+
+## Detached Displays
+
+An awake network device is not necessarily attached to the Windows desktop. Before display-dependent couch-mode work, check `QDC_ONLY_ACTIVE_PATHS`; if the target is missing, query `QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE` and match the target by friendly name while retaining its adapter LUID and target ID. Deduplicate full-topology paths by that identity rather than display index.
+
+To attach a matched available target as an extended display, copy every active path and mode unchanged, assign the new path an unused source ID, and append an explicit source mode containing the configured TV resolution and position. Relative position keywords anchor directly to the configured desk display and do not account for intervening monitors. When both explicit `x` and `y` are configured, use those absolute virtual-desktop coordinates instead. Request the configured target refresh instead of accepting best-mode defaults. For virtual-mode-aware paths, encode the source-mode index in the upper 16 bits and use an invalid clone-group ID.
+
+Do not pass `SDC_ALLOW_CHANGES` for this transaction: Windows can otherwise rearrange supplied source positions. Poll until the requested resolution and physical refresh are active, verify every pre-existing display's geometry exactly, and retry once after the cold-attach settle period. Roll back to the pre-attach topology if verification fails. Desk mode should leave attachment unchanged.
+
+HDMI audio endpoints can appear after the display path. Give couch audio discovery a short settle delay and one retry.
+
+## Samsung Source Detection
+
+The S95B/Tizen 6.5 local `http://<tv>:8001/api/v2/` response does not expose the active HDMI source. Current `samsung-tv-ws-api` and Home Assistant local integration behavior confirm that source selection is command-based; exact source reporting requires optional SmartThings cloud state.
+
+Keep `assumeInputWhenOn` as the local-only fallback. `true` avoids disruptive source navigation by trusting an already-on TV; use `false` or `tvmode couch --force-input` when certainty matters more than preserving the current source.
+
+## Audio Interop
+
+On the tested Windows 11 system, MMDevice enumeration can throw `InvalidCastException` / `E_NOINTERFACE` (`0x80004002`) from `Marshal.GetTypedObjectForIUnknown`. Keep the detailed log and registry enumeration fallback; the fallback is known to work and the COM cast is a low-priority issue unless Windows removes the registry data path.

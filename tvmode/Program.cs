@@ -28,6 +28,7 @@ internal static class TvMode
     private const int ExitError = 1;
     internal static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
+        ReadCommentHandling = JsonCommentHandling.Skip,
         WriteIndented = true
     };
 
@@ -39,6 +40,16 @@ internal static class TvMode
 
     public static async Task<int> RunAsync(string[] args)
     {
+        if (args.Length == 1 && args[0].Equals("displays", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunDisplayDiagnostic();
+        }
+
+        if (args.Length == 2 && args[0].Equals("hdr-status", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunHdrStatusDiagnostic(args[1]);
+        }
+
         if (args.Length == 1 && args[0].Equals("input-direct", StringComparison.OrdinalIgnoreCase))
         {
             return await RunInputDirectDiagnosticAsync();
@@ -86,6 +97,15 @@ internal static class TvMode
         if (mode == "desk")
         {
             var displayOk = RunStep("display", () => DisplayManager.SetPrimary(config.DeskDisplayMatch));
+            if (config.HdrEnabled)
+            {
+                await RunWarningStepAsync("hdr", () => DisplayManager.SetHdrWithRetryAsync(config.CouchDisplayMatch, false));
+            }
+            else
+            {
+                Log("hdr", true, "disabled by config; skipped");
+            }
+
             RunStep("windows", () => WindowManager.RestoreFromState(windowStatePath));
             var audioOk = RunStep("audio", () => AudioManager.SetDefaultPlaybackDevice(config.DeskAudioMatch));
             return displayOk && audioOk ? ExitOk : ExitError;
@@ -193,9 +213,35 @@ internal static class TvMode
             Log("input", false, "skipped because TV was not reachable");
         }
 
-        var couchDisplayOk = RunStep("display", () => DisplayManager.SetPrimary(config.CouchDisplayMatch));
+        var couchAttachResult = await RunDisplayAttachStepAsync(() => DisplayManager.EnsureAttachedAsync(
+            config.CouchDisplayMatch,
+            config.DeskDisplayMatch,
+            config.ResolvedTvDisplayMode,
+            config.ColdAttachSettleDelay));
+        var couchAttachOk = couchAttachResult.Success;
+        var couchPrimaryOk = RunStep("display", () => DisplayManager.SetPrimary(config.CouchDisplayMatch));
+        var couchDisplayOk = couchAttachOk && couchPrimaryOk;
+        if (config.HdrEnabled)
+        {
+            if (couchAttachOk)
+            {
+                TimeSpan? initialHdrDelay = couchAttachResult.AttachedNow || couchAttachResult.ModeChanged
+                    ? TimeSpan.FromSeconds(3)
+                    : null;
+                await RunWarningStepAsync("hdr", () => DisplayManager.SetHdrWithRetryAsync(config.CouchDisplayMatch, true, initialHdrDelay));
+            }
+            else
+            {
+                Console.WriteLine("hdr: warning - skipped because the TV display mode was not confirmed");
+            }
+        }
+        else
+        {
+            Log("hdr", true, "disabled by config; skipped");
+        }
+
         RunStep("windows", () => WindowManager.MinimizeOnDisplay(config.MinimizeDisplayMatch, windowStatePath));
-        var couchAudioOk = RunStep("audio", () => AudioManager.SetDefaultPlaybackDevice(config.CouchAudioMatch));
+        var couchAudioOk = await RunStepAsync("audio", () => AudioManager.SetDefaultPlaybackDeviceWithRetryAsync(config.CouchAudioMatch));
 
         return couchDisplayOk && couchAudioOk ? ExitOk : ExitError;
     }
@@ -248,7 +294,23 @@ internal static class TvMode
         Console.Error.WriteLine("Diagnostic: tvmode input-direct");
         Console.Error.WriteLine("Diagnostic: tvmode key <KEYNAME> [Click|PressRelease]");
         Console.Error.WriteLine("Diagnostic: tvmode audio-repro <audio device name substring>");
+        Console.Error.WriteLine("Diagnostic: tvmode displays");
+        Console.Error.WriteLine("Diagnostic: tvmode hdr-status <display name substring>");
         Console.Error.WriteLine("Place tvmode.json next to tvmode.exe before running.");
+    }
+
+    private static int RunDisplayDiagnostic()
+    {
+        var result = DisplayManager.DescribeActiveDisplays();
+        Log("displays", result.Success, result.Message);
+        return result.Success ? ExitOk : ExitError;
+    }
+
+    private static int RunHdrStatusDiagnostic(string displayMatch)
+    {
+        var result = DisplayManager.DescribeHdrState(displayMatch);
+        Log("hdr-status", result.Success, result.Message);
+        return result.Success ? ExitOk : ExitError;
     }
 
     private static async Task<int> RunInputDirectDiagnosticAsync()
@@ -334,6 +396,41 @@ internal static class TvMode
         }
     }
 
+    private static async Task<DisplayAttachResult> RunDisplayAttachStepAsync(Func<Task<DisplayAttachResult>> step)
+    {
+        try
+        {
+            var result = await step();
+            Log("display-attach", result.Success, result.Message);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log("display-attach", false, ex.Message);
+            return DisplayAttachResult.Fail(ex.Message);
+        }
+    }
+
+    private static async Task RunWarningStepAsync(string name, Func<Task<StepResult>> step)
+    {
+        try
+        {
+            var result = await step();
+            if (result.Success)
+            {
+                Log(name, true, result.Message);
+            }
+            else
+            {
+                Console.WriteLine($"{name}: warning - {result.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"{name}: warning - {ex.Message}");
+        }
+    }
+
     private static void Log(string name, bool success, string message)
     {
         var status = success ? "ok" : "fail";
@@ -356,13 +453,20 @@ internal sealed record TvModeConfig(
     int? TvInputRightPresses = null,
     string? MinimizeDisplayMatch = null,
     bool? AssumeInputWhenOn = null,
-    int? WakeSettleDelayMs = null)
+    int? WakeSettleDelayMs = null,
+    string? Hdr = null,
+    TvDisplayModeConfig? TvDisplayMode = null,
+    int? ColdAttachSettleDelayMs = null)
 {
     public TimeSpan InterKeyDelay => TimeSpan.FromMilliseconds(InterKeyDelayMs ?? 700);
     public TimeSpan SourceBarOpenDelay => TimeSpan.FromMilliseconds(SourceBarOpenDelayMs ?? 1000);
     public TimeSpan WakeSettleDelay => TimeSpan.FromMilliseconds(WakeSettleDelayMs ?? 4000);
     public string ResolvedInputMethod => string.IsNullOrWhiteSpace(InputMethod) ? "auto" : InputMethod.Trim().ToLowerInvariant();
     public bool AssumeInputWhenOnResolved => AssumeInputWhenOn ?? true;
+    public string ResolvedHdr => string.IsNullOrWhiteSpace(Hdr) ? "on" : Hdr.Trim().ToLowerInvariant();
+    public bool HdrEnabled => ResolvedHdr == "on";
+    public TvDisplayModeConfig ResolvedTvDisplayMode => TvDisplayMode ?? new TvDisplayModeConfig();
+    public TimeSpan ColdAttachSettleDelay => TimeSpan.FromMilliseconds(ColdAttachSettleDelayMs ?? 5000);
 
     public bool IsValid(out string error)
     {
@@ -434,6 +538,68 @@ internal sealed record TvModeConfig(
             return false;
         }
 
+        if (ResolvedHdr is not ("on" or "off"))
+        {
+            error = $"invalid {nameof(Hdr)}: {Hdr}. Expected on or off.";
+            return false;
+        }
+
+        if (!ResolvedTvDisplayMode.IsValid(out error))
+        {
+            return false;
+        }
+
+        if (ColdAttachSettleDelayMs is <= 0)
+        {
+            error = $"invalid {nameof(ColdAttachSettleDelayMs)}: {ColdAttachSettleDelayMs}";
+            return false;
+        }
+
+        error = string.Empty;
+        return true;
+    }
+}
+
+internal sealed record TvDisplayModeConfig(
+    int? Width = null,
+    int? Height = null,
+    double? RefreshHz = null,
+    string? Position = null,
+    int? X = null,
+    int? Y = null)
+{
+    public int ResolvedWidth => Width ?? 3840;
+    public int ResolvedHeight => Height ?? 2160;
+    public double ResolvedRefreshHz => RefreshHz ?? 144;
+    public string ResolvedPosition => string.IsNullOrWhiteSpace(Position) ? "rightofdesk" : Position.Trim().ToLowerInvariant();
+    public bool HasExplicitCoordinates => X.HasValue && Y.HasValue;
+
+    public bool IsValid(out string error)
+    {
+        if (ResolvedWidth <= 0 || ResolvedHeight <= 0)
+        {
+            error = $"invalid tvDisplayMode dimensions: {ResolvedWidth}x{ResolvedHeight}";
+            return false;
+        }
+
+        if (!double.IsFinite(ResolvedRefreshHz) || ResolvedRefreshHz <= 0)
+        {
+            error = $"invalid tvDisplayMode refreshHz: {ResolvedRefreshHz}";
+            return false;
+        }
+
+        if (X.HasValue != Y.HasValue)
+        {
+            error = "tvDisplayMode x and y must either both be set or both be omitted";
+            return false;
+        }
+
+        if (!HasExplicitCoordinates && ResolvedPosition is not ("rightofdesk" or "leftofdesk" or "abovedesk" or "belowdesk"))
+        {
+            error = $"invalid tvDisplayMode position: {Position}. Expected rightOfDesk, leftOfDesk, aboveDesk, or belowDesk.";
+            return false;
+        }
+
         error = string.Empty;
         return true;
     }
@@ -443,6 +609,14 @@ internal readonly record struct StepResult(bool Success, string Message)
 {
     public static StepResult Ok(string message) => new(true, message);
     public static StepResult Fail(string message) => new(false, message);
+}
+
+internal readonly record struct DisplayAttachResult(bool Success, bool AttachedNow, bool ModeChanged, string Message)
+{
+    public static DisplayAttachResult Ok(string message, bool attachedNow = false, bool modeChanged = false) =>
+        new(true, attachedNow, modeChanged, message);
+
+    public static DisplayAttachResult Fail(string message) => new(false, false, false, message);
 }
 
 internal readonly record struct TvPowerStateResult(bool Reachable, string? PowerState, string Message)
@@ -1091,16 +1265,538 @@ internal readonly record struct SamsungRemoteKeyStep(string Key, int Times, Time
 
 internal static class DisplayManager
 {
+    private static readonly TimeSpan HdrSettleDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan HdrVerificationTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan DisplayModePollInterval = TimeSpan.FromMilliseconds(500);
+    private const uint QDC_ALL_PATHS = 0x00000001;
     private const uint QDC_ONLY_ACTIVE_PATHS = 0x00000002;
+    private const uint QDC_VIRTUAL_MODE_AWARE = 0x00000010;
     private const int ERROR_SUCCESS = 0;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
     private const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
     private const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
+    private const uint DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO = 9;
+    private const uint DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE = 10;
+    private const uint DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2 = 15;
+    private const uint DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE = 16;
     private const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
+    private const uint DISPLAYCONFIG_MODE_INFO_TYPE_TARGET = 2;
+    private const uint DISPLAYCONFIG_PIXELFORMAT_32BPP = 4;
+    private const uint DISPLAYCONFIG_PATH_ACTIVE = 0x00000001;
+    private const uint DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE = 0x00000008;
+    private const uint DISPLAYCONFIG_PATH_MODE_IDX_INVALID = 0xFFFFFFFF;
+    private const uint DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID = 0xFFFF;
     private const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
     private const uint SDC_APPLY = 0x00000080;
     private const uint SDC_SAVE_TO_DATABASE = 0x00000200;
-    private const uint SDC_ALLOW_CHANGES = 0x00000400;
+    private const uint SDC_FORCE_MODE_ENUMERATION = 0x00001000;
+    private const uint SDC_VIRTUAL_MODE_AWARE = 0x00008000;
+
+    public static StepResult DescribeActiveDisplays()
+    {
+        try
+        {
+            var state = QueryActiveDisplays();
+            foreach (var path in state.Paths)
+            {
+                var sourceModeIndex = FindSourceModeIndex(state.Modes, path.sourceInfo.adapterId, path.sourceInfo.id);
+                if (sourceModeIndex < 0)
+                {
+                    Console.WriteLine($"display: {GetTargetFriendlyName(path)} | source mode unavailable");
+                    continue;
+                }
+
+                var source = state.Modes[sourceModeIndex].modeInfo.sourceMode;
+                var refreshHz = GetPhysicalRefreshHz(path, state.Modes);
+                var primary = source.position.x == 0 && source.position.y == 0 ? " | primary" : string.Empty;
+                Console.WriteLine(
+                    $"display: {GetTargetFriendlyName(path)} | position=({source.position.x},{source.position.y}) | " +
+                    $"mode={source.width}x{source.height} {refreshHz:0.###}Hz{primary}");
+            }
+
+            return StepResult.Ok($"listed {state.Paths.Length} active displays");
+        }
+        catch (Exception ex)
+        {
+            return StepResult.Fail(ex.Message);
+        }
+    }
+
+    public static StepResult DescribeHdrState(string displayMatch)
+    {
+        try
+        {
+            var displayState = QueryActiveDisplays();
+            var matches = displayState.Paths
+                .Select(path => new { Path = path, Name = GetTargetFriendlyName(path) })
+                .Where(target => target.Name.Contains(displayMatch, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (matches.Count != 1)
+            {
+                var available = string.Join("; ", displayState.Paths.Select(GetTargetFriendlyName));
+                return StepResult.Fail(matches.Count == 0
+                    ? $"no active display matched '{displayMatch}'. Available: {available}"
+                    : $"multiple active displays matched '{displayMatch}'");
+            }
+
+            var match = matches[0];
+            var state = ReadHdrState(match.Path.targetInfo.adapterId, match.Path.targetInfo.id);
+            return state.Success
+                ? StepResult.Ok($"{match.Name}: {state.Description}")
+                : StepResult.Fail($"could not read HDR state for {match.Name}: {state.Error}");
+        }
+        catch (Exception ex)
+        {
+            return StepResult.Fail(ex.Message);
+        }
+    }
+
+    public static async Task<DisplayAttachResult> EnsureAttachedAsync(
+        string displayMatch,
+        string deskDisplayMatch,
+        TvDisplayModeConfig desiredMode,
+        TimeSpan settleDelay)
+    {
+        var activeState = QueryActiveDisplays();
+        var activeMatches = activeState.Paths
+            .Select((path, index) => new { Path = path, Index = index, Name = GetTargetFriendlyName(path) })
+            .Where(target => target.Name.Contains(displayMatch, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (activeMatches.Count > 1)
+        {
+            var activeNames = string.Join("; ", activeMatches.Select(target => target.Name));
+            return DisplayAttachResult.Fail($"multiple active displays matched '{displayMatch}': {activeNames}");
+        }
+
+        if (activeMatches.Count == 1)
+        {
+            return await EnsureActiveModeAsync(
+                activeState,
+                activeMatches[0].Index,
+                activeMatches[0].Name,
+                deskDisplayMatch,
+                desiredMode,
+                settleDelay);
+        }
+
+        var allState = QueryDisplays(QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE);
+        var candidates = GetAvailableDisplayTargets(allState);
+        var matches = candidates
+            .Where(candidate => candidate.FriendlyName.Contains(displayMatch, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (matches.Count != 1)
+        {
+            var available = string.Join("; ", candidates.Select(candidate => candidate.FriendlyName));
+            return DisplayAttachResult.Fail(matches.Count == 0
+                ? $"no available display matched '{displayMatch}' in QDC_ALL_PATHS. Available: {available}"
+                : $"multiple available displays matched '{displayMatch}' in QDC_ALL_PATHS: {string.Join("; ", matches.Select(candidate => candidate.FriendlyName))}");
+        }
+
+        var selected = matches[0];
+        var path = allState.Paths[selected.PathIndex];
+        if ((path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
+        {
+            return DisplayAttachResult.Fail($"{selected.FriendlyName} became active while display paths were queried; rerun couch to verify its mode");
+        }
+
+        var anchorMatches = activeState.Paths
+            .Select(pathInfo => new { Path = pathInfo, Name = GetTargetFriendlyName(pathInfo) })
+            .Where(target => target.Name.Contains(deskDisplayMatch, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (anchorMatches.Count != 1)
+        {
+            var available = string.Join("; ", activeState.Paths.Select(GetTargetFriendlyName));
+            return DisplayAttachResult.Fail(anchorMatches.Count == 0
+                ? $"cannot place TV relative to desk display '{deskDisplayMatch}'. Active displays: {available}"
+                : $"multiple active desk displays matched '{deskDisplayMatch}'");
+        }
+
+        var anchorSourceIndex = FindSourceModeIndex(
+            activeState.Modes,
+            anchorMatches[0].Path.sourceInfo.adapterId,
+            anchorMatches[0].Path.sourceInfo.id);
+        if (anchorSourceIndex < 0)
+        {
+            return DisplayAttachResult.Fail($"desk display '{anchorMatches[0].Name}' has no source mode");
+        }
+
+        var anchorMode = activeState.Modes[anchorSourceIndex].modeInfo.sourceMode;
+        var tvPosition = CalculateRelativePosition(anchorMode, desiredMode);
+
+        var usedSourceIds = activeState.Paths
+            .Where(candidate =>
+                candidate.sourceInfo.adapterId.Equals(path.sourceInfo.adapterId))
+            .Select(candidate => candidate.sourceInfo.id)
+            .ToHashSet();
+        uint sourceId = 0;
+        while (usedSourceIds.Contains(sourceId))
+        {
+            sourceId++;
+        }
+
+        var modes = activeState.Modes.ToList();
+        var sourceModeIndex = modes.Count;
+        modes.Add(new DISPLAYCONFIG_MODE_INFO
+        {
+            infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+            id = sourceId,
+            adapterId = path.sourceInfo.adapterId,
+            modeInfo = new DISPLAYCONFIG_MODE_INFO_UNION
+            {
+                sourceMode = new DISPLAYCONFIG_SOURCE_MODE
+                {
+                    width = (uint)desiredMode.ResolvedWidth,
+                    height = (uint)desiredMode.ResolvedHeight,
+                    pixelFormat = DISPLAYCONFIG_PIXELFORMAT_32BPP,
+                    position = tvPosition
+                }
+            }
+        });
+
+        path.sourceInfo.id = sourceId;
+        path.sourceInfo.modeInfoIdx = EncodeSourceModeIndex(path, sourceModeIndex);
+        path.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        path.targetInfo.refreshRate = ToRefreshRate(desiredMode.ResolvedRefreshHz);
+        path.targetInfo.scanLineOrdering = 0;
+        path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+        var paths = activeState.Paths.Append(path).ToArray();
+        var originalLayout = CaptureLayout(activeState);
+        var expectedPosition = tvPosition;
+        var lastFailure = string.Empty;
+
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            var setResult = ApplyExactDisplayConfig(paths, modes.ToArray());
+            if (setResult != ERROR_SUCCESS)
+            {
+                lastFailure = $"SetDisplayConfig {Win32ErrorName(setResult)} ({setResult})";
+            }
+            else
+            {
+                var verification = await WaitForDisplayStateAsync(
+                    selected.Target,
+                    desiredMode,
+                    expectedPosition,
+                    originalLayout,
+                    settleDelay);
+                if (verification.Success)
+                {
+                    return DisplayAttachResult.Ok(
+                        $"attached {selected.FriendlyName} at {desiredMode.ResolvedWidth}x{desiredMode.ResolvedHeight} " +
+                        $"{desiredMode.ResolvedRefreshHz:0.###}Hz, position ({expectedPosition.x},{expectedPosition.y}); " +
+                        $"preserved {originalLayout.Count} existing display layouts; attempt {attempt} succeeded",
+                        attachedNow: true,
+                        modeChanged: true);
+                }
+
+                lastFailure = verification.Message;
+            }
+        }
+
+        var rollbackResult = ApplyExactDisplayConfig(activeState.Paths, activeState.Modes);
+        return DisplayAttachResult.Fail(
+            $"could not attach {selected.FriendlyName} with the configured mode after one retry: {lastFailure}; " +
+            $"restored the pre-attach topology with {Win32ErrorName(rollbackResult)} ({rollbackResult})");
+    }
+
+    private static async Task<DisplayAttachResult> EnsureActiveModeAsync(
+        DisplayState activeState,
+        int pathIndex,
+        string friendlyName,
+        string deskDisplayMatch,
+        TvDisplayModeConfig desiredMode,
+        TimeSpan settleDelay)
+    {
+        var path = activeState.Paths[pathIndex];
+        var sourceModeIndex = FindSourceModeIndex(activeState.Modes, path.sourceInfo.adapterId, path.sourceInfo.id);
+        if (sourceModeIndex < 0)
+        {
+            return DisplayAttachResult.Fail($"active display '{friendlyName}' has no source mode");
+        }
+
+        var currentSource = activeState.Modes[sourceModeIndex].modeInfo.sourceMode;
+        var currentRefresh = GetPhysicalRefreshHz(path, activeState.Modes);
+        var expectedPosition = currentSource.position;
+        var deskMatches = activeState.Paths
+            .Select(pathInfo => new { Path = pathInfo, Name = GetTargetFriendlyName(pathInfo) })
+            .Where(target => target.Name.Contains(deskDisplayMatch, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (deskMatches.Count == 1)
+        {
+            var deskSourceIndex = FindSourceModeIndex(
+                activeState.Modes,
+                deskMatches[0].Path.sourceInfo.adapterId,
+                deskMatches[0].Path.sourceInfo.id);
+            if (deskSourceIndex >= 0)
+            {
+                var deskSource = activeState.Modes[deskSourceIndex].modeInfo.sourceMode;
+                if (deskSource.position.x == 0 && deskSource.position.y == 0)
+                {
+                    expectedPosition = CalculateRelativePosition(deskSource, desiredMode);
+                }
+            }
+        }
+
+        if (ModeMatches(currentSource, currentRefresh, desiredMode) &&
+            currentSource.position.x == expectedPosition.x &&
+            currentSource.position.y == expectedPosition.y)
+        {
+            return DisplayAttachResult.Ok(
+                $"{friendlyName} is already attached at {currentSource.width}x{currentSource.height} " +
+                $"{currentRefresh:0.###}Hz; configured mode confirmed");
+        }
+
+        var targetIdentity = new DisplayTargetIdentity(path.targetInfo.adapterId, path.targetInfo.id);
+        var originalLayout = CaptureLayout(activeState);
+        originalLayout.Remove(targetIdentity);
+        var modes = activeState.Modes.ToArray();
+        var updatedMode = modes[sourceModeIndex];
+        updatedMode.modeInfo.sourceMode.width = (uint)desiredMode.ResolvedWidth;
+        updatedMode.modeInfo.sourceMode.height = (uint)desiredMode.ResolvedHeight;
+        updatedMode.modeInfo.sourceMode.position = expectedPosition;
+        modes[sourceModeIndex] = updatedMode;
+
+        var paths = activeState.Paths.ToArray();
+        path.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        path.targetInfo.refreshRate = ToRefreshRate(desiredMode.ResolvedRefreshHz);
+        path.targetInfo.scanLineOrdering = 0;
+        paths[pathIndex] = path;
+
+        var lastFailure = string.Empty;
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            var setResult = ApplyExactDisplayConfig(paths, modes);
+            if (setResult != ERROR_SUCCESS)
+            {
+                lastFailure = $"SetDisplayConfig {Win32ErrorName(setResult)} ({setResult})";
+            }
+            else
+            {
+                var verification = await WaitForDisplayStateAsync(
+                    targetIdentity,
+                    desiredMode,
+                    expectedPosition,
+                    originalLayout,
+                    settleDelay);
+                if (verification.Success)
+                {
+                    return DisplayAttachResult.Ok(
+                        $"corrected {friendlyName} to {desiredMode.ResolvedWidth}x{desiredMode.ResolvedHeight} " +
+                        $"{desiredMode.ResolvedRefreshHz:0.###}Hz without moving other displays; attempt {attempt} succeeded",
+                        modeChanged: true);
+                }
+
+                lastFailure = verification.Message;
+            }
+        }
+
+        var rollbackResult = ApplyExactDisplayConfig(activeState.Paths, activeState.Modes);
+        return DisplayAttachResult.Fail(
+            $"could not apply the configured mode to {friendlyName} after one retry: {lastFailure}; " +
+            $"rollback {Win32ErrorName(rollbackResult)} ({rollbackResult})");
+    }
+
+    private static int ApplyExactDisplayConfig(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
+    {
+        return NativeMethods.SetDisplayConfig(
+            (uint)paths.Length,
+            paths,
+            (uint)modes.Length,
+            modes,
+            SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+            SDC_APPLY |
+            SDC_SAVE_TO_DATABASE |
+            SDC_FORCE_MODE_ENUMERATION |
+            SDC_VIRTUAL_MODE_AWARE);
+    }
+
+    private static async Task<StepResult> WaitForDisplayStateAsync(
+        DisplayTargetIdentity target,
+        TvDisplayModeConfig desiredMode,
+        POINTL expectedPosition,
+        IReadOnlyDictionary<DisplayTargetIdentity, SourceGeometry> originalLayout,
+        TimeSpan timeout)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var lastFailure = "display state was not available";
+        while (stopwatch.Elapsed < timeout)
+        {
+            try
+            {
+                var verification = VerifyDisplayState(target, desiredMode, expectedPosition, originalLayout);
+                if (verification.Success)
+                {
+                    return verification;
+                }
+
+                lastFailure = verification.Message;
+            }
+            catch (Exception ex)
+            {
+                lastFailure = ex.Message;
+            }
+
+            await Task.Delay(DisplayModePollInterval);
+        }
+
+        return StepResult.Fail($"not confirmed within {timeout.TotalMilliseconds:0}ms: {lastFailure}");
+    }
+
+    private static StepResult VerifyDisplayState(
+        DisplayTargetIdentity target,
+        TvDisplayModeConfig desiredMode,
+        POINTL expectedPosition,
+        IReadOnlyDictionary<DisplayTargetIdentity, SourceGeometry> originalLayout)
+    {
+        var current = QueryActiveDisplays();
+        var matchedPath = current.Paths.FirstOrDefault(path =>
+            path.targetInfo.adapterId.Equals(target.AdapterId) && path.targetInfo.id == target.TargetId);
+        if ((matchedPath.flags & DISPLAYCONFIG_PATH_ACTIVE) == 0)
+        {
+            return StepResult.Fail("TV target is not in the active path list");
+        }
+
+        var sourceModeIndex = FindSourceModeIndex(current.Modes, matchedPath.sourceInfo.adapterId, matchedPath.sourceInfo.id);
+        if (sourceModeIndex < 0)
+        {
+            return StepResult.Fail("TV target has no active source mode");
+        }
+
+        var sourceMode = current.Modes[sourceModeIndex].modeInfo.sourceMode;
+        var refreshHz = GetPhysicalRefreshHz(matchedPath, current.Modes);
+        if (!ModeMatches(sourceMode, refreshHz, desiredMode))
+        {
+            return StepResult.Fail(
+                $"TV mode is {sourceMode.width}x{sourceMode.height} {refreshHz:0.###}Hz, expected " +
+                $"{desiredMode.ResolvedWidth}x{desiredMode.ResolvedHeight} {desiredMode.ResolvedRefreshHz:0.###}Hz");
+        }
+
+        if (sourceMode.position.x != expectedPosition.x || sourceMode.position.y != expectedPosition.y)
+        {
+            return StepResult.Fail(
+                $"TV position is ({sourceMode.position.x},{sourceMode.position.y}), expected ({expectedPosition.x},{expectedPosition.y})");
+        }
+
+        var currentLayout = CaptureLayout(current);
+        foreach (var (identity, expected) in originalLayout)
+        {
+            if (!currentLayout.TryGetValue(identity, out var actual))
+            {
+                return StepResult.Fail($"existing display target {identity.TargetId} disappeared during attach");
+            }
+
+            if (actual != expected)
+            {
+                return StepResult.Fail(
+                    $"existing display target {identity.TargetId} moved or changed: " +
+                    $"was {expected.Width}x{expected.Height} at ({expected.X},{expected.Y}), " +
+                    $"now {actual.Width}x{actual.Height} at ({actual.X},{actual.Y})");
+            }
+        }
+
+        return StepResult.Ok($"confirmed {sourceMode.width}x{sourceMode.height} {refreshHz:0.###}Hz and preserved existing layout");
+    }
+
+    private static Dictionary<DisplayTargetIdentity, SourceGeometry> CaptureLayout(DisplayState state)
+    {
+        var layout = new Dictionary<DisplayTargetIdentity, SourceGeometry>();
+        foreach (var path in state.Paths.Where(path => (path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0))
+        {
+            var sourceModeIndex = FindSourceModeIndex(state.Modes, path.sourceInfo.adapterId, path.sourceInfo.id);
+            if (sourceModeIndex < 0)
+            {
+                continue;
+            }
+
+            var source = state.Modes[sourceModeIndex].modeInfo.sourceMode;
+            layout[new DisplayTargetIdentity(path.targetInfo.adapterId, path.targetInfo.id)] =
+                new SourceGeometry(source.width, source.height, source.position.x, source.position.y);
+        }
+
+        return layout;
+    }
+
+    private static POINTL CalculateRelativePosition(DISPLAYCONFIG_SOURCE_MODE anchor, TvDisplayModeConfig desiredMode)
+    {
+        if (desiredMode.HasExplicitCoordinates)
+        {
+            return new POINTL { x = desiredMode.X!.Value, y = desiredMode.Y!.Value };
+        }
+
+        return desiredMode.ResolvedPosition switch
+        {
+            "rightofdesk" => new POINTL { x = checked(anchor.position.x + (int)anchor.width), y = anchor.position.y },
+            "leftofdesk" => new POINTL { x = checked(anchor.position.x - desiredMode.ResolvedWidth), y = anchor.position.y },
+            "abovedesk" => new POINTL { x = anchor.position.x, y = checked(anchor.position.y - desiredMode.ResolvedHeight) },
+            "belowdesk" => new POINTL { x = anchor.position.x, y = checked(anchor.position.y + (int)anchor.height) },
+            _ => throw new InvalidOperationException($"unsupported TV display position {desiredMode.ResolvedPosition}")
+        };
+    }
+
+    private static uint EncodeSourceModeIndex(DISPLAYCONFIG_PATH_INFO path, int modeIndex)
+    {
+        if ((path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) == 0)
+        {
+            return checked((uint)modeIndex);
+        }
+
+        if (modeIndex >= DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID)
+        {
+            throw new InvalidOperationException("display source mode index exceeds the virtual-mode limit");
+        }
+
+        return (checked((uint)modeIndex) << 16) | DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID;
+    }
+
+    private static DISPLAYCONFIG_RATIONAL ToRefreshRate(double refreshHz)
+    {
+        const uint denominator = 1000;
+        var numerator = checked((uint)Math.Round(refreshHz * denominator));
+        var divisor = GreatestCommonDivisor(numerator, denominator);
+        return new DISPLAYCONFIG_RATIONAL
+        {
+            Numerator = numerator / divisor,
+            Denominator = denominator / divisor
+        };
+    }
+
+    private static uint GreatestCommonDivisor(uint left, uint right)
+    {
+        while (right != 0)
+        {
+            (left, right) = (right, left % right);
+        }
+
+        return left;
+    }
+
+    private static double GetPhysicalRefreshHz(DISPLAYCONFIG_PATH_INFO path, DISPLAYCONFIG_MODE_INFO[] modes)
+    {
+        var targetModeIndex = (path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) != 0
+            ? (int)(path.targetInfo.modeInfoIdx >> 16)
+            : (int)path.targetInfo.modeInfoIdx;
+        if (targetModeIndex >= 0 && targetModeIndex < modes.Length &&
+            modes[targetModeIndex].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+        {
+            return ToDouble(modes[targetModeIndex].modeInfo.targetMode.targetVideoSignalInfo.vSyncFreq);
+        }
+
+        return ToDouble(path.targetInfo.refreshRate);
+    }
+
+    private static double ToDouble(DISPLAYCONFIG_RATIONAL value)
+    {
+        return value.Denominator == 0 ? 0 : (double)value.Numerator / value.Denominator;
+    }
+
+    private static bool ModeMatches(DISPLAYCONFIG_SOURCE_MODE source, double refreshHz, TvDisplayModeConfig desiredMode)
+    {
+        return source.width == desiredMode.ResolvedWidth &&
+            source.height == desiredMode.ResolvedHeight &&
+            Math.Abs(refreshHz - desiredMode.ResolvedRefreshHz) <= 0.5;
+    }
 
     public static StepResult SetPrimary(string displayMatch)
     {
@@ -1157,11 +1853,203 @@ internal static class DisplayManager
             displayState.Paths,
             (uint)displayState.Modes.Length,
             displayState.Modes,
-            SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES);
+            SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_SAVE_TO_DATABASE | SDC_VIRTUAL_MODE_AWARE);
 
         return setResult == ERROR_SUCCESS
             ? StepResult.Ok($"set {matches[0].Name} primary")
             : StepResult.Fail($"SetDisplayConfig failed: {Win32ErrorName(setResult)} ({setResult})");
+    }
+
+    public static async Task<StepResult> SetHdrWithRetryAsync(
+        string displayMatch,
+        bool enabled,
+        TimeSpan? initialSettleDelay = null)
+    {
+        var attempts = new List<string>();
+        await Task.Delay(initialSettleDelay ?? HdrSettleDelay);
+
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            StepResult result;
+            try
+            {
+                result = await SetHdrAsync(displayMatch, enabled);
+            }
+            catch (Exception ex)
+            {
+                result = StepResult.Fail(ex.Message);
+            }
+
+            if (result.Success)
+            {
+                return StepResult.Ok($"{result.Message}; attempt {attempt} succeeded");
+            }
+
+            attempts.Add($"attempt {attempt}: {result.Message}");
+            if (attempt == 1)
+            {
+                await Task.Delay(HdrSettleDelay);
+            }
+        }
+
+        var action = enabled ? "enable" : "disable";
+        return StepResult.Fail($"could not {action} HDR after one retry ({string.Join("; ", attempts)})");
+    }
+
+    private static async Task<StepResult> SetHdrAsync(string displayMatch, bool enabled)
+    {
+        var displayState = QueryActiveDisplays();
+        var targets = displayState.Paths
+            .Select(path => new { Path = path, Name = GetTargetFriendlyName(path) })
+            .ToList();
+        var matches = targets
+            .Where(target => target.Name.Contains(displayMatch, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (matches.Count != 1)
+        {
+            var available = string.Join("; ", targets.Select(target => target.Name));
+            return StepResult.Fail(matches.Count == 0
+                ? $"no active display matched TV display '{displayMatch}'. Available: {available}"
+                : $"multiple active displays matched TV display '{displayMatch}'. Available: {available}");
+        }
+
+        var match = matches[0];
+        var path = match.Path;
+        var state = ReadHdrState(path.targetInfo.adapterId, path.targetInfo.id);
+        if (!state.Success)
+        {
+            return StepResult.Fail($"could not read HDR state for {match.Name}: {state.Error}");
+        }
+
+        if (state.Matches(enabled))
+        {
+            return StepResult.Ok(
+                $"HDR already {(enabled ? "enabled" : "disabled")} on {match.Name}; verified {state.Description}");
+        }
+
+        if (enabled && !state.HdrSupported)
+        {
+            return StepResult.Fail($"{match.Name} does not report HDR support; {state.Description}");
+        }
+
+        if (enabled && state.LimitedByPolicy)
+        {
+            return StepResult.Fail($"HDR is limited by Windows policy for {match.Name}; {state.Description}");
+        }
+
+        var setter = state.UsesV2 ? "DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE" : "legacy SET_ADVANCED_COLOR_STATE";
+        var setResult = state.UsesV2
+            ? SetHdrStateV2(path.targetInfo.adapterId, path.targetInfo.id, enabled)
+            : SetAdvancedColorStateLegacy(path.targetInfo.adapterId, path.targetInfo.id, enabled);
+        if (state.UsesV2 && IsDeviceInfoTypeUnsupported(setResult))
+        {
+            setter = "legacy SET_ADVANCED_COLOR_STATE fallback";
+            setResult = SetAdvancedColorStateLegacy(path.targetInfo.adapterId, path.targetInfo.id, enabled);
+        }
+
+        if (setResult != ERROR_SUCCESS)
+        {
+            return StepResult.Fail(
+                $"{setter} failed for {match.Name}: {Win32ErrorName(setResult)} ({setResult}); pre-set {state.Description}");
+        }
+
+        var verification = await WaitForHdrStateAsync(
+            path.targetInfo.adapterId,
+            path.targetInfo.id,
+            enabled,
+            HdrVerificationTimeout);
+        return verification.Success
+            ? StepResult.Ok(
+                $"{(enabled ? "enabled" : "disabled")} HDR on {match.Name} via {setter}; verified {verification.Message}")
+            : StepResult.Fail(
+                $"{setter} returned success for {match.Name}, but post-set verification failed: {verification.Message}");
+    }
+
+    private static async Task<StepResult> WaitForHdrStateAsync(
+        LUID adapterId,
+        uint targetId,
+        bool enabled,
+        TimeSpan timeout)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var lastState = "state unavailable";
+        do
+        {
+            var state = ReadHdrState(adapterId, targetId);
+            if (!state.Success)
+            {
+                lastState = state.Error;
+            }
+            else
+            {
+                lastState = state.Description;
+                if (state.Matches(enabled))
+                {
+                    return StepResult.Ok(state.Description);
+                }
+            }
+
+            await Task.Delay(DisplayModePollInterval);
+        }
+        while (stopwatch.Elapsed < timeout);
+
+        return StepResult.Fail($"expected HDR {(enabled ? "on" : "off")} within {timeout.TotalMilliseconds:0}ms; last read: {lastState}");
+    }
+
+    private static HdrStateRead ReadHdrState(LUID adapterId, uint targetId)
+    {
+        var colorInfoV2 = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2.Create(
+            DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2,
+            adapterId,
+            targetId);
+        var getV2Result = NativeMethods.DisplayConfigGetDeviceInfo(ref colorInfoV2);
+        if (getV2Result == ERROR_SUCCESS)
+        {
+            return HdrStateRead.FromV2(colorInfoV2);
+        }
+
+        if (!IsDeviceInfoTypeUnsupported(getV2Result))
+        {
+            return HdrStateRead.Fail(
+                $"GET_ADVANCED_COLOR_INFO_2 {Win32ErrorName(getV2Result)} ({getV2Result})");
+        }
+
+        var legacyInfo = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO.Create(
+            DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+            adapterId,
+            targetId);
+        var legacyResult = NativeMethods.DisplayConfigGetDeviceInfo(ref legacyInfo);
+        return legacyResult == ERROR_SUCCESS
+            ? HdrStateRead.FromLegacy(legacyInfo, getV2Result)
+            : HdrStateRead.Fail(
+                $"GET_ADVANCED_COLOR_INFO_2 unsupported ({getV2Result}); legacy query " +
+                $"{Win32ErrorName(legacyResult)} ({legacyResult})");
+    }
+
+    private static int SetHdrStateV2(LUID adapterId, uint targetId, bool enabled)
+    {
+        var state = DISPLAYCONFIG_SET_HDR_STATE.Create(
+            DISPLAYCONFIG_DEVICE_INFO_SET_HDR_STATE,
+            adapterId,
+            targetId,
+            enabled);
+        return NativeMethods.DisplayConfigSetDeviceInfo(ref state);
+    }
+
+    private static int SetAdvancedColorStateLegacy(LUID adapterId, uint targetId, bool enabled)
+    {
+        var state = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE.Create(
+            DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+            adapterId,
+            targetId,
+            enabled);
+        return NativeMethods.DisplayConfigSetDeviceInfo(ref state);
+    }
+
+    private static bool IsDeviceInfoTypeUnsupported(int result)
+    {
+        return result is 1 or 50 or 87;
     }
 
     public static DisplayMonitorMatch FindMonitorDevicesByFriendlyName(string? displayMatch)
@@ -1198,10 +2086,15 @@ internal static class DisplayManager
 
     private static DisplayState QueryActiveDisplays()
     {
+        return QueryDisplays(QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE);
+    }
+
+    private static DisplayState QueryDisplays(uint queryFlags)
+    {
         var result = ERROR_SUCCESS;
         for (var attempt = 0; attempt < 3; attempt++)
         {
-            result = NativeMethods.GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out var pathCount, out var modeCount);
+            result = NativeMethods.GetDisplayConfigBufferSizes(queryFlags, out var pathCount, out var modeCount);
             if (result != ERROR_SUCCESS)
             {
                 throw new InvalidOperationException($"GetDisplayConfigBufferSizes failed: {Win32ErrorName(result)} ({result})");
@@ -1209,7 +2102,7 @@ internal static class DisplayManager
 
             var paths = new DISPLAYCONFIG_PATH_INFO[(int)pathCount];
             var modes = new DISPLAYCONFIG_MODE_INFO[(int)modeCount];
-            result = NativeMethods.QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+            result = NativeMethods.QueryDisplayConfig(queryFlags, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
             if (result == ERROR_INSUFFICIENT_BUFFER)
             {
                 continue;
@@ -1226,6 +2119,28 @@ internal static class DisplayManager
         }
 
         throw new InvalidOperationException($"QueryDisplayConfig failed after retrying changed buffers: {Win32ErrorName(result)} ({result})");
+    }
+
+    private static List<AvailableDisplayTarget> GetAvailableDisplayTargets(DisplayState displayState)
+    {
+        var targets = new List<AvailableDisplayTarget>();
+        var seenTargets = new HashSet<DisplayTargetIdentity>();
+        for (var index = 0; index < displayState.Paths.Length; index++)
+        {
+            var path = displayState.Paths[index];
+            if (path.targetInfo.targetAvailable == 0)
+            {
+                continue;
+            }
+
+            var identity = new DisplayTargetIdentity(path.targetInfo.adapterId, path.targetInfo.id);
+            if (seenTargets.Add(identity))
+            {
+                targets.Add(new AvailableDisplayTarget(index, identity, GetTargetFriendlyName(path)));
+            }
+        }
+
+        return targets;
     }
 
     private static string GetTargetFriendlyName(DISPLAYCONFIG_PATH_INFO path)
@@ -1282,16 +2197,115 @@ internal static class DisplayManager
         return result switch
         {
             ERROR_SUCCESS => "ERROR_SUCCESS",
+            1 => "ERROR_INVALID_FUNCTION",
             5 => "ERROR_ACCESS_DENIED",
             31 => "ERROR_GEN_FAILURE",
             50 => "ERROR_NOT_SUPPORTED",
             87 => "ERROR_INVALID_PARAMETER",
             ERROR_INSUFFICIENT_BUFFER => "ERROR_INSUFFICIENT_BUFFER",
+            1610 => "ERROR_BAD_CONFIGURATION",
             _ => "UNKNOWN"
         };
     }
 
     private readonly record struct DisplayState(DISPLAYCONFIG_PATH_INFO[] Paths, DISPLAYCONFIG_MODE_INFO[] Modes);
+    private readonly record struct DisplayTargetIdentity(LUID AdapterId, uint TargetId);
+    private readonly record struct SourceGeometry(uint Width, uint Height, int X, int Y);
+    private readonly record struct HdrStateRead(
+        bool Success,
+        bool UsesV2,
+        bool HdrSupported,
+        bool HdrUserEnabled,
+        bool HdrActive,
+        bool LimitedByPolicy,
+        bool LegacyAdvancedColorEnabled,
+        bool AdvancedColorActive,
+        uint BitsPerColorChannel,
+        string ActiveColorMode,
+        string Error,
+        int V2UnavailableResult)
+    {
+        public string Description => UsesV2
+            ? $"activeColorMode={ActiveColorMode}; highDynamicRangeUserEnabled={HdrUserEnabled.ToString().ToLowerInvariant()}; " +
+              $"highDynamicRangeSupported={HdrSupported.ToString().ToLowerInvariant()}; " +
+              $"advancedColorActive={AdvancedColorActive.ToString().ToLowerInvariant()}; bitsPerColorChannel={BitsPerColorChannel}"
+            : $"activeColorMode=unavailable (legacy fallback; v2 result {V2UnavailableResult}); " +
+              $"advancedColorEnabled={LegacyAdvancedColorEnabled.ToString().ToLowerInvariant()}; " +
+              $"advancedColorSupported={HdrSupported.ToString().ToLowerInvariant()}";
+
+        public bool Matches(bool enabled)
+        {
+            return UsesV2
+                ? enabled
+                    ? HdrActive && HdrUserEnabled
+                    : !HdrActive && !HdrUserEnabled
+                : LegacyAdvancedColorEnabled == enabled;
+        }
+
+        public static HdrStateRead FromV2(DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 info)
+        {
+            var mode = FormatActiveColorMode(info.activeColorMode);
+            return new HdrStateRead(
+                true,
+                true,
+                info.HighDynamicRangeSupported,
+                info.HighDynamicRangeUserEnabled,
+                info.activeColorMode == DISPLAYCONFIG_ADVANCED_COLOR_MODE.HDR && info.AdvancedColorActive,
+                info.AdvancedColorLimitedByPolicy,
+                false,
+                info.AdvancedColorActive,
+                info.bitsPerColorChannel,
+                mode,
+                string.Empty,
+                ERROR_SUCCESS);
+        }
+
+        public static HdrStateRead FromLegacy(DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO info, int v2UnavailableResult)
+        {
+            return new HdrStateRead(
+                true,
+                false,
+                info.AdvancedColorSupported,
+                info.AdvancedColorEnabled,
+                info.AdvancedColorEnabled,
+                info.AdvancedColorForceDisabled,
+                info.AdvancedColorEnabled,
+                info.AdvancedColorEnabled,
+                info.bitsPerColorChannel,
+                "unavailable",
+                string.Empty,
+                v2UnavailableResult);
+        }
+
+        public static HdrStateRead Fail(string error)
+        {
+            return new HdrStateRead(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                0,
+                "unavailable",
+                error,
+                ERROR_SUCCESS);
+        }
+
+        private static string FormatActiveColorMode(DISPLAYCONFIG_ADVANCED_COLOR_MODE mode)
+        {
+            return mode switch
+            {
+                DISPLAYCONFIG_ADVANCED_COLOR_MODE.SDR => "SDR",
+                DISPLAYCONFIG_ADVANCED_COLOR_MODE.WCG => "WCG",
+                DISPLAYCONFIG_ADVANCED_COLOR_MODE.HDR => "HDR",
+                _ => $"UNKNOWN({(uint)mode})"
+            };
+        }
+    }
+    private sealed record AvailableDisplayTarget(int PathIndex, DisplayTargetIdentity Target, string FriendlyName);
     private sealed record DisplayTarget(string FriendlyName, string DeviceName);
 }
 
@@ -1497,10 +2511,34 @@ internal static class WindowManager
 
 internal static class AudioManager
 {
+    private static readonly TimeSpan AudioSettleDelay = TimeSpan.FromSeconds(1);
     private const uint DeviceStateActive = 0x00000001;
     private const uint StgmRead = 0x00000000;
     private static readonly PROPERTYKEY PKeyDeviceFriendlyName = new(new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), 14);
     private static readonly PROPERTYKEY PKeyDeviceInterfaceFriendlyName = new(new Guid("b3f8fa53-0004-438e-9003-51a46e139bfc"), 6);
+
+    public static async Task<StepResult> SetDefaultPlaybackDeviceWithRetryAsync(string audioMatch)
+    {
+        var attempts = new List<string>();
+        await Task.Delay(AudioSettleDelay);
+
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            var result = SetDefaultPlaybackDevice(audioMatch);
+            if (result.Success)
+            {
+                return StepResult.Ok($"{result.Message}; attempt {attempt} succeeded");
+            }
+
+            attempts.Add($"attempt {attempt}: {result.Message}");
+            if (attempt == 1)
+            {
+                await Task.Delay(AudioSettleDelay);
+            }
+        }
+
+        return StepResult.Fail($"audio switch failed after one retry ({string.Join("; ", attempts)})");
+    }
 
     public static StepResult SetDefaultPlaybackDevice(string audioMatch)
     {
@@ -1820,6 +2858,18 @@ internal static partial class NativeMethods
     [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")]
     internal static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);
 
+    [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")]
+    internal static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO requestPacket);
+
+    [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")]
+    internal static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 requestPacket);
+
+    [DllImport("user32.dll", EntryPoint = "DisplayConfigSetDeviceInfo")]
+    internal static extern int DisplayConfigSetDeviceInfo(ref DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE setPacket);
+
+    [DllImport("user32.dll", EntryPoint = "DisplayConfigSetDeviceInfo")]
+    internal static extern int DisplayConfigSetDeviceInfo(ref DISPLAYCONFIG_SET_HDR_STATE setPacket);
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
@@ -1946,6 +2996,113 @@ internal struct DISPLAYCONFIG_SOURCE_DEVICE_NAME
                 id = id
             },
             viewGdiDeviceName = string.Empty
+        };
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public uint value;
+    public uint colorEncoding;
+    public uint bitsPerColorChannel;
+
+    public readonly bool AdvancedColorSupported => (value & 0x1) != 0;
+    public readonly bool AdvancedColorEnabled => (value & 0x2) != 0;
+    public readonly bool AdvancedColorForceDisabled => (value & 0x8) != 0;
+
+    public static DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO Create(uint type, LUID adapterId, uint id)
+    {
+        return new DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO
+        {
+            header = new DISPLAYCONFIG_DEVICE_INFO_HEADER
+            {
+                type = type,
+                size = (uint)Marshal.SizeOf<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>(),
+                adapterId = adapterId,
+                id = id
+            }
+        };
+    }
+}
+
+internal enum DISPLAYCONFIG_ADVANCED_COLOR_MODE : uint
+{
+    SDR = 0,
+    WCG = 1,
+    HDR = 2
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public uint value;
+    public uint colorEncoding;
+    public uint bitsPerColorChannel;
+    public DISPLAYCONFIG_ADVANCED_COLOR_MODE activeColorMode;
+
+    public readonly bool AdvancedColorActive => (value & 0x2) != 0;
+    public readonly bool AdvancedColorLimitedByPolicy => (value & 0x8) != 0;
+    public readonly bool HighDynamicRangeSupported => (value & 0x10) != 0;
+    public readonly bool HighDynamicRangeUserEnabled => (value & 0x20) != 0;
+
+    public static DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 Create(uint type, LUID adapterId, uint id)
+    {
+        return new DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2
+        {
+            header = new DISPLAYCONFIG_DEVICE_INFO_HEADER
+            {
+                type = type,
+                size = (uint)Marshal.SizeOf<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2>(),
+                adapterId = adapterId,
+                id = id
+            }
+        };
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public uint value;
+
+    public static DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE Create(uint type, LUID adapterId, uint id, bool enabled)
+    {
+        return new DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE
+        {
+            header = new DISPLAYCONFIG_DEVICE_INFO_HEADER
+            {
+                type = type,
+                size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>(),
+                adapterId = adapterId,
+                id = id
+            },
+            value = enabled ? 1u : 0u
+        };
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_SET_HDR_STATE
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public uint value;
+
+    public static DISPLAYCONFIG_SET_HDR_STATE Create(uint type, LUID adapterId, uint id, bool enabled)
+    {
+        return new DISPLAYCONFIG_SET_HDR_STATE
+        {
+            header = new DISPLAYCONFIG_DEVICE_INFO_HEADER
+            {
+                type = type,
+                size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SET_HDR_STATE>(),
+                adapterId = adapterId,
+                id = id
+            },
+            value = enabled ? 1u : 0u
         };
     }
 }
