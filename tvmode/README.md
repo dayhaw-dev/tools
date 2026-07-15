@@ -2,6 +2,8 @@
 
 One-command switching between desk mode and couch mode on Windows 11.
 
+Every invocation writes timestamped output to `tvmode.log` next to the executable, including the tool version, command, all step and diagnostic lines, and the final exit code. Concurrent runs use synchronized shared appends and include a PID on every line, so a Stream Deck double-press does not lose or mix the two traces. The log rotates at 1 MiB and keeps three backups (`tvmode.log.1` through `.3`) so launches without a visible console remain diagnosable.
+
 `tvmode couch` wakes the living room Samsung TV, selects the configured HDMI input when needed, reconnects the TV to the extended Windows desktop if it was set to "Disconnect this display," makes it primary, enables HDR on the TV, minimizes windows on the configured monitor, and switches audio to the couch device.
 
 `tvmode desk` makes the desk display primary, disables HDR on the TV, restores windows minimized by the last `couch` run, and switches audio back to the desk device. It does not power off or otherwise touch the TV.
@@ -25,6 +27,7 @@ Copy `tvmode.example.json` to `tvmode.json` next to `tvmode.exe`, then fill in y
 | `inputMethod` | `keys`, `direct`, or `auto`. The tested S95B path is `keys`. |
 | `tvInputLeftPresses` | Left-anchor press count for source-bar navigation. |
 | `sourceBarOpenDelayMs` | Delay after `KEY_SOURCE` before navigation starts. Defaults to `1000`. |
+| `coldSourceBarOpenDelayMs` | Longer post-`KEY_SOURCE` delay after a deep-standby/WoL wake. Defaults to `3000`. |
 | `tvInputRightPresses` | Right press count after the left-anchor burst. |
 | `minimizeDisplayMatch` | Display whose windows are minimized during `couch`. |
 | `assumeInputWhenOn` | Local REST cannot identify the active HDMI. `true` trusts an already-on TV; use `false` or `couch --force-input` when it may be on another source. Defaults to `true`. |
@@ -45,6 +48,7 @@ See [implementation notes](NOTES.md) for Samsung API details, diagnostics, and t
 tvmode couch
 tvmode couch --force-input
 tvmode desk
+tvmode --version
 tvmode input-direct
 tvmode key KEY_HOME
 tvmode key KEY_HOME PressRelease

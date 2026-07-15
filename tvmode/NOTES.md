@@ -6,11 +6,13 @@ These notes keep the diagnostic history and Samsung TV behavior details out of t
 
 Display and audio matches are case-insensitive substrings.
 
-The tested S95B couch setup uses `inputMethod: "keys"`, `tvInputLeftPresses: 5`, `tvInputRightPresses: 5`, `sourceBarOpenDelayMs: 1000`, and `wakeSettleDelayMs: 4000`.
+The tested S95B couch setup uses `inputMethod: "keys"`, `tvInputLeftPresses: 5`, `tvInputRightPresses: 5`, `sourceBarOpenDelayMs: 1000`, `coldSourceBarOpenDelayMs: 3000`, and `wakeSettleDelayMs: 4000`.
 
 If `inputMethod` is omitted it defaults to `auto`, which preserves direct-launch behavior. Use `direct` to force direct source launch, or `keys` to use only source-bar navigation and never attempt direct launch.
 
 `sourceBarOpenDelayMs` waits after `KEY_SOURCE` before the first navigation key so the source-bar animation does not eat a press.
+
+`coldSourceBarOpenDelayMs` defaults to `3000` and replaces `sourceBarOpenDelayMs` only when initial REST contact failed and the run took the deep-standby/WoL path. The TV can accept `KEY_SOURCE` before its freshly booted source bar is ready for directional keys; the longer delay prevents the left-anchor burst from being partially eaten. Already-on and fast-standby/KEY_POWER paths keep the shorter warm delay.
 
 `tvInputLeftPresses` controls the left-anchor burst. Set it to `0` if `couch` is always run from a cold wake where the TV opens the source bar on the leftmost tuner entry, and keep the burst if `couch` may run while the TV is sitting on an arbitrary input.
 
@@ -64,13 +66,17 @@ The direct source-launch payload is also serialized with Samsung-exact casing:
 {"method":"ms.channel.emit","params":{"event":"ed.apps.launch","to":"host","data":{"appId":"org.tizen.tv.inputdevice","action_type":"NATIVE_LAUNCH","metaTag":"HDMI4"}}}
 ```
 
+That payload remains available only for diagnostics and explicit `direct`/`auto` configuration. It is not a supported direct-input route on the tested S95B: the TV accepts it without changing source or returning a useful result.
+
 ## Source Detection Research
 
 Current HDMI/source detection research for 2022 Tizen/S95B: the unauthenticated local REST device-info endpoint at `http://tvIp:8001/api/v2/` / `https://tvIp:8002/api/v2/` exposes device metadata and, on some models, `PowerState`, but not the active HDMI source.
 
 `samsung-tv-ws-api` exposes REST device info, app status/run/install, websocket app launching, and remote keys, but no current-source read.
 
-Home Assistant's built-in `samsungtv` integration similarly treats source selection as commands (`KEY_TV`, `KEY_HDMI`, or app launch) and uses device info only for power/model metadata.
+The current [`samsung-tv-ws-api` remote implementation](https://github.com/xchwarze/samsung-tv-ws-api/blob/master/samsungtvws/remote.py) launches installed apps through `ed.apps.launch`, but it has no HDMI app identifier or source-selection method. Its dedicated [HDMI-selection issue](https://github.com/xchwarze/samsung-tv-ws-api/issues/112) concluded that explicit HDMI selection is unavailable locally; `KEY_HDMI` can only cycle inputs from a known starting state.
+
+Home Assistant's built-in [`samsungtv` integration](https://github.com/home-assistant/core/blob/dev/homeassistant/components/samsungtv/media_player.py) likewise maps only `TV` and generic `HDMI` to `KEY_TV` and `KEY_HDMI`; installed applications are the only sources launched by app ID. Its [specific-HDMI investigation](https://github.com/home-assistant/core/issues/147250) found that adding `KEY_HDMI1`, `KEY_HDMI2`, and similar names made options visible but the TVs silently ignored those keys. Direct port selection reported by other integrations uses SmartThings cloud state/control rather than the local port 8002 channel.
 
 Integrations that report an exact HDMI source on these models rely on optional SmartThings cloud state. `tvmode` remains local-only and does not require a Samsung account or cloud token.
 
@@ -85,6 +91,8 @@ If REST reports `PowerState: "on"`, the TV is treated as genuinely awake and `as
 If REST is reachable but `PowerState` is `standby`, missing, or ambiguous, `tvmode` treats that as fast standby: it connects to the tokenized websocket, sends `KEY_POWER`, polls REST until `PowerState: "on"` for up to about 15 seconds, waits `wakeSettleDelayMs`, then always runs KEY_SOURCE navigation.
 
 If REST is unreachable, `tvmode` treats that as deep standby/off: it sends WoL, waits for port `8002`, waits `wakeSettleDelayMs`, then runs full KEY_SOURCE navigation.
+
+On that deep-standby path, KEY_SOURCE navigation uses `coldSourceBarOpenDelayMs` after opening the source bar. Other navigation paths use `sourceBarOpenDelayMs`.
 
 `tvmode couch --force-input` overrides the on-state skip and sends KEY_SOURCE navigation regardless.
 
@@ -127,6 +135,10 @@ On the tested system, MMDevice enumeration throws `InvalidCastException` (`E_NOI
 The v1.2.1 couch and desk transitions were verified end to end on the S95B setup. Starting with the TV manually detached, `couch` restored the configured virtual-desktop coordinates without moving the existing displays, established 3840x2160 at 144 Hz, enabled HDR with `activeColorMode=HDR`, and found the HDMI audio endpoint on the first attempt. `desk` restored the desk primary display, saved windows, and desk audio, then disabled HDR with the non-HDR active color mode confirmed by the v2 query.
 
 ## Diagnostics
+
+Every run, including diagnostics and invalid command/config paths, is timestamped in `tvmode.log` next to the executable. Both stdout and stderr are captured. The file rotates at 1 MiB with three retained backups, and each run records its tool version, command, process ID, elapsed time, and exit code. Concurrent processes open the log with shared read/write access and serialize each seek-and-append through a path-scoped named mutex; every line carries its PID so overlapping traces remain attributable. Rotation is deferred while another run still has the current log open.
+
+`tvmode --version` prints only the tool name and semantic version to the terminal and returns exit code `0`; its versioned run header and footer are still written to the rolling log.
 
 `displays` lists each active display's friendly name, DisplayConfig source position, source resolution, physical refresh, and primary state without changing topology. Use these coordinates for `tvDisplayMode.x` and `y`; unlike `System.Windows.Forms.Screen.Bounds`, they are not DPI-virtualized.
 

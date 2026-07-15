@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -14,11 +15,389 @@ using System.Text.RegularExpressions;
 
 internal static class Program
 {
+    internal static string ToolVersion { get; } = GetToolVersion();
+
     [STAThread]
     private static int Main(string[] args)
     {
         NativeMethods.AttachConsole(NativeMethods.ATTACH_PARENT_PROCESS);
-        return TvMode.RunAsync(args).GetAwaiter().GetResult();
+        var versionOnly = args.Length == 1 && args[0].Equals("--version", StringComparison.OrdinalIgnoreCase);
+        var originalOut = Console.Out;
+        var originalError = Console.Error;
+        var logPath = Path.Combine(AppContext.BaseDirectory, "tvmode.log");
+        RollingRunLog? runLog = null;
+        TimestampingTeeTextWriter? loggedOut = null;
+        TimestampingTeeTextWriter? loggedError = null;
+        var stopwatch = Stopwatch.StartNew();
+        var exitCode = 1;
+
+        try
+        {
+            try
+            {
+                runLog = RollingRunLog.Open(logPath);
+                loggedOut = new TimestampingTeeTextWriter(originalOut, runLog, "out");
+                loggedError = new TimestampingTeeTextWriter(originalError, runLog, "err");
+                Console.SetOut(TextWriter.Synchronized(loggedOut));
+                Console.SetError(TextWriter.Synchronized(loggedError));
+            }
+            catch (Exception ex)
+            {
+                originalError.WriteLine($"log: warning - could not open {logPath}: {ex.Message}");
+            }
+
+            WriteRunBoundary(
+                $"run: start - version={ToolVersion}; command={FormatCommand(args)}; pid={Environment.ProcessId}; log={Path.GetFileName(logPath)}",
+                versionOnly,
+                runLog);
+            exitCode = TvMode.RunAsync(args).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"run: fatal - {ex}");
+        }
+        finally
+        {
+            WriteRunBoundary(
+                $"run: end - exitCode={exitCode}; elapsedMs={stopwatch.Elapsed.TotalMilliseconds:0}",
+                versionOnly,
+                runLog);
+            loggedOut?.Complete();
+            loggedError?.Complete();
+            Console.SetOut(originalOut);
+            Console.SetError(originalError);
+            runLog?.Dispose();
+        }
+
+        return exitCode;
+    }
+
+    private static void WriteRunBoundary(string message, bool logOnly, RollingRunLog? runLog)
+    {
+        if (logOnly && runLog is not null)
+        {
+            runLog.WriteLine("out", message);
+            return;
+        }
+
+        Console.WriteLine(message);
+    }
+
+    private static string GetToolVersion()
+    {
+        var version = typeof(Program).Assembly.GetName().Version;
+        return version is null
+            ? "unknown"
+            : $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}";
+    }
+
+    private static string FormatCommand(IEnumerable<string> args)
+    {
+        return "tvmode" + string.Concat(args.Select(argument => " " + QuoteArgument(argument)));
+    }
+
+    private static string QuoteArgument(string argument)
+    {
+        if (argument.Length == 0)
+        {
+            return "\"\"";
+        }
+
+        return argument.Any(char.IsWhiteSpace) || argument.Contains('"')
+            ? "\"" + argument.Replace("\"", "\\\"") + "\""
+            : argument;
+    }
+}
+
+internal sealed class RollingRunLog : IDisposable
+{
+    private const long MaxLogBytes = 1024 * 1024;
+    private const int BackupCount = 3;
+    private const int OpenRetryCount = 20;
+    private const int OpenRetryDelayMs = 100;
+    private readonly object _sync = new();
+    private readonly FileStream _stream;
+    private readonly Mutex _appendMutex;
+    private readonly int _processId;
+
+    private RollingRunLog(FileStream stream, Mutex appendMutex)
+    {
+        _stream = stream;
+        _appendMutex = appendMutex;
+        _processId = Environment.ProcessId;
+    }
+
+    public static RollingRunLog Open(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var appendMutex = new Mutex(false, GetMutexName(fullPath));
+        var ownsMutex = false;
+        var opened = false;
+
+        try
+        {
+            EnterMutex(appendMutex);
+            ownsMutex = true;
+            TryRotateIfNeeded(fullPath);
+            var log = new RollingRunLog(OpenSharedAppendStream(fullPath), appendMutex);
+            opened = true;
+            return log;
+        }
+        finally
+        {
+            if (ownsMutex)
+            {
+                appendMutex.ReleaseMutex();
+            }
+
+            if (!opened)
+            {
+                appendMutex.Dispose();
+            }
+        }
+    }
+
+    public void WriteLine(string channel, string line)
+    {
+        var record =
+            $"{DateTimeOffset.Now:yyyy-MM-dd'T'HH:mm:ss.fffzzz} [pid={_processId} {channel}] {line}{Environment.NewLine}";
+        var bytes = Encoding.UTF8.GetBytes(record);
+
+        lock (_sync)
+        {
+            EnterMutex(_appendMutex);
+            try
+            {
+                _stream.Seek(0, SeekOrigin.End);
+                _stream.Write(bytes);
+                _stream.Flush(flushToDisk: true);
+            }
+            finally
+            {
+                _appendMutex.ReleaseMutex();
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            _stream.Dispose();
+            _appendMutex.Dispose();
+        }
+    }
+
+    private static FileStream OpenSharedAppendStream(string path)
+    {
+        IOException? lastError = null;
+        for (var attempt = 1; attempt <= OpenRetryCount; attempt++)
+        {
+            try
+            {
+                return new FileStream(
+                    path,
+                    FileMode.OpenOrCreate,
+                    FileAccess.Write,
+                    FileShare.ReadWrite,
+                    4096,
+                    FileOptions.WriteThrough);
+            }
+            catch (IOException ex) when (attempt < OpenRetryCount)
+            {
+                lastError = ex;
+                Thread.Sleep(OpenRetryDelayMs);
+            }
+        }
+
+        throw lastError ?? new IOException($"could not open run log '{path}'");
+    }
+
+    private static string GetMutexName(string path)
+    {
+        var normalizedPath = path.ToUpperInvariant();
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalizedPath));
+        return $@"Local\dayhaw.tvmode.log.{Convert.ToHexString(hash.AsSpan(0, 16))}";
+    }
+
+    private static void EnterMutex(Mutex mutex)
+    {
+        try
+        {
+            mutex.WaitOne();
+        }
+        catch (AbandonedMutexException)
+        {
+            // The abandoned owner is gone; this process now owns the mutex.
+        }
+    }
+
+    private static void TryRotateIfNeeded(string path)
+    {
+        if (!File.Exists(path) || new FileInfo(path).Length < MaxLogBytes)
+        {
+            return;
+        }
+
+        try
+        {
+            using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                // An exclusive probe prevents rotation while another run owns an open log handle.
+            }
+
+            var oldest = path + $".{BackupCount}";
+            if (File.Exists(oldest))
+            {
+                File.Delete(oldest);
+            }
+
+            for (var index = BackupCount - 1; index >= 1; index--)
+            {
+                var source = path + $".{index}";
+                if (File.Exists(source))
+                {
+                    File.Move(source, path + $".{index + 1}", true);
+                }
+            }
+
+            File.Move(path, path + ".1", true);
+        }
+        catch (IOException)
+        {
+            // Keep appending if another run or a transient file lock prevents rotation.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // A rotation failure must not cost this run its diagnostic log.
+        }
+    }
+}
+
+internal sealed class TimestampingTeeTextWriter : TextWriter
+{
+    private readonly object _sync = new();
+    private readonly TextWriter _console;
+    private readonly RollingRunLog _log;
+    private readonly string _channel;
+    private readonly StringBuilder _pending = new();
+
+    public TimestampingTeeTextWriter(TextWriter console, RollingRunLog log, string channel)
+    {
+        _console = console;
+        _log = log;
+        _channel = channel;
+    }
+
+    public override Encoding Encoding => Encoding.UTF8;
+
+    public override void Write(char value)
+    {
+        lock (_sync)
+        {
+            TryConsoleWrite(() => _console.Write(value));
+            AppendToLog(value);
+        }
+    }
+
+    public override void Write(string? value)
+    {
+        if (value is null)
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            TryConsoleWrite(() => _console.Write(value));
+            AppendToLog(value);
+        }
+    }
+
+    public override void WriteLine(string? value)
+    {
+        lock (_sync)
+        {
+            TryConsoleWrite(() => _console.WriteLine(value));
+            if (value is not null)
+            {
+                AppendToLog(value);
+            }
+
+            FlushLogLine();
+        }
+    }
+
+    public override void WriteLine()
+    {
+        lock (_sync)
+        {
+            TryConsoleWrite(_console.WriteLine);
+            FlushLogLine();
+        }
+    }
+
+    public override void Flush()
+    {
+        lock (_sync)
+        {
+            TryConsoleWrite(_console.Flush);
+        }
+    }
+
+    public void Complete()
+    {
+        lock (_sync)
+        {
+            if (_pending.Length > 0)
+            {
+                FlushLogLine();
+            }
+
+            TryConsoleWrite(_console.Flush);
+        }
+    }
+
+    private void AppendToLog(string value)
+    {
+        foreach (var character in value)
+        {
+            AppendToLog(character);
+        }
+    }
+
+    private void AppendToLog(char value)
+    {
+        if (value == '\n')
+        {
+            FlushLogLine();
+        }
+        else if (value != '\r')
+        {
+            _pending.Append(value);
+        }
+    }
+
+    private void FlushLogLine()
+    {
+        _log.WriteLine(_channel, _pending.ToString());
+        _pending.Clear();
+    }
+
+    private static void TryConsoleWrite(Action write)
+    {
+        try
+        {
+            write();
+        }
+        catch (IOException)
+        {
+            // A WinExe launched without a parent console still writes to the run log.
+        }
+        catch (ObjectDisposedException)
+        {
+            // The persistent log remains available if the attached console closes mid-run.
+        }
     }
 }
 
@@ -40,6 +419,12 @@ internal static class TvMode
 
     public static async Task<int> RunAsync(string[] args)
     {
+        if (args.Length == 1 && args[0].Equals("--version", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"tvmode {Program.ToolVersion}");
+            return ExitOk;
+        }
+
         if (args.Length == 1 && args[0].Equals("displays", StringComparison.OrdinalIgnoreCase))
         {
             return RunDisplayDiagnostic();
@@ -116,6 +501,7 @@ internal static class TvMode
         var mustNavigateInput = forceInput;
         var canAssumeInputWhenOn = false;
         var applyWakeSettleDelay = false;
+        var coldBootInputNavigation = false;
         var initialPower = await NetworkTools.QueryTvPowerStateAsync(config.TvIp);
         var tvOnline = false;
 
@@ -155,6 +541,7 @@ internal static class TvMode
         else
         {
             mustNavigateInput = true;
+            coldBootInputNavigation = true;
             Log("wake", true, $"path=deep-standby; REST PowerState={initialPower.StateForLog}; sending WoL");
             await RunStepAsync("wol", () => NetworkTools.SendWakeOnLanAsync(config.TvMac));
             tvOnline = await RunStepAsync("network", async () =>
@@ -186,6 +573,18 @@ internal static class TvMode
             }
             else
             {
+                var sourceBarOpenDelay = coldBootInputNavigation
+                    ? config.ColdSourceBarOpenDelay
+                    : config.SourceBarOpenDelay;
+                if (inputMethod?.Equals("keys", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    var timingPath = coldBootInputNavigation ? "cold-boot" : "warm";
+                    Log(
+                        "input-timing",
+                        true,
+                        $"path={timingPath}; waiting {sourceBarOpenDelay.TotalMilliseconds:0}ms after KEY_SOURCE before navigation");
+                }
+
                 var reason = forceInput
                     ? "--force-input requested KEY_SOURCE navigation"
                     : mustNavigateInput
@@ -199,7 +598,7 @@ internal static class TvMode
                         tokenPath,
                         inputMethod,
                         config.InterKeyDelay,
-                        config.SourceBarOpenDelay,
+                        sourceBarOpenDelay,
                         config.TvInputLeftPresses,
                         config.TvInputRightPresses);
                     return result.Success
@@ -291,6 +690,7 @@ internal static class TvMode
     {
         Console.Error.WriteLine("Usage: tvmode couch|desk");
         Console.Error.WriteLine("Usage: tvmode couch --force-input");
+        Console.Error.WriteLine("Usage: tvmode --version");
         Console.Error.WriteLine("Diagnostic: tvmode input-direct");
         Console.Error.WriteLine("Diagnostic: tvmode key <KEYNAME> [Click|PressRelease]");
         Console.Error.WriteLine("Diagnostic: tvmode audio-repro <audio device name substring>");
@@ -450,6 +850,7 @@ internal sealed record TvModeConfig(
     string? InputMethod = null,
     int? TvInputLeftPresses = null,
     int? SourceBarOpenDelayMs = null,
+    int? ColdSourceBarOpenDelayMs = null,
     int? TvInputRightPresses = null,
     string? MinimizeDisplayMatch = null,
     bool? AssumeInputWhenOn = null,
@@ -460,6 +861,7 @@ internal sealed record TvModeConfig(
 {
     public TimeSpan InterKeyDelay => TimeSpan.FromMilliseconds(InterKeyDelayMs ?? 700);
     public TimeSpan SourceBarOpenDelay => TimeSpan.FromMilliseconds(SourceBarOpenDelayMs ?? 1000);
+    public TimeSpan ColdSourceBarOpenDelay => TimeSpan.FromMilliseconds(ColdSourceBarOpenDelayMs ?? 3000);
     public TimeSpan WakeSettleDelay => TimeSpan.FromMilliseconds(WakeSettleDelayMs ?? 4000);
     public string ResolvedInputMethod => string.IsNullOrWhiteSpace(InputMethod) ? "auto" : InputMethod.Trim().ToLowerInvariant();
     public bool AssumeInputWhenOnResolved => AssumeInputWhenOn ?? true;
@@ -529,6 +931,12 @@ internal sealed record TvModeConfig(
         if (SourceBarOpenDelayMs is < 0)
         {
             error = $"invalid {nameof(SourceBarOpenDelayMs)}: {SourceBarOpenDelayMs}";
+            return false;
+        }
+
+        if (ColdSourceBarOpenDelayMs is < 0)
+        {
+            error = $"invalid {nameof(ColdSourceBarOpenDelayMs)}: {ColdSourceBarOpenDelayMs}";
             return false;
         }
 
