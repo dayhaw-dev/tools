@@ -482,15 +482,6 @@ internal static class TvMode
         if (mode == "desk")
         {
             var displayOk = RunStep("display", () => DisplayManager.SetPrimary(config.DeskDisplayMatch));
-            if (config.HdrEnabled)
-            {
-                await RunWarningStepAsync("hdr", () => DisplayManager.SetHdrWithRetryAsync(config.CouchDisplayMatch, false));
-            }
-            else
-            {
-                Log("hdr", true, "disabled by config; skipped");
-            }
-
             RunStep("windows", () => WindowManager.RestoreFromState(windowStatePath));
             var audioOk = RunStep("audio", () => AudioManager.SetDefaultPlaybackDevice(config.DeskAudioMatch));
             return displayOk && audioOk ? ExitOk : ExitError;
